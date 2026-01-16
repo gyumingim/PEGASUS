@@ -19,6 +19,8 @@ from isaacsim.core.utils import prims
 from omni.usd import get_stage_next_free_path
 from isaacsim.storage.native import get_assets_root_path
 
+from omni.isaac.core import SimulationContext
+
 # New imports from the replicator API
 import omni.anim.graph.core as ag
 import isaacsim.replicator.agent.core
@@ -76,6 +78,10 @@ class Person:
         self._state = State()
         self._state.position = np.array(init_pos)
         self._state.orientation = Rotation.from_euler('z', init_yaw, degrees=False).as_quat()
+
+        # Auxiliar variable to compute the velocity of the person using discrete differentiation
+        self._previous_position = np.array(init_pos)
+        self._total_dt = 0.0
 
         # Set the target position for the character
         self._target_position = np.array(init_pos)
@@ -237,6 +243,16 @@ class Person:
             # Update the current state of the person
             self._state.position = np.array([pos[0], pos[1], pos[2]])
             self._state.orientation = np.array([rot.x, rot.y, rot.z, rot.w])
+
+            # Compute the velocity in the inertial frame using discrete differentiation
+            self._total_dt += dt
+
+            # Note: we are updating the linear velocity at 20 Hz to avoid noise in the velocity estimation
+            # this is not ideal, but it works for now until NVIDIA provides a better way to get the linear velocity of the character
+            if self._total_dt > 1/20.0:  # Update at 20 Hz
+                self._state.linear_velocity = (self._state.position - self._previous_position) / self._total_dt
+                self._previous_position = np.array(self._state.position)
+                self._total_dt = 0.0
 
             # Signal the controller the updated state
             if self._controller:
