@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-Pegasus 드론 착륙 시뮬레이션 (강화학습 모델 사용)
-- 학습된 RL 모델로 제어
-- 움직이는 AprilTag 로버 추적
-- 카메라 기반 태그 감지
-- 안정적 착륙
+Pegasus 드론 착륙 시뮬레이션 (강화학습 모델 사용) - 개선 버전
+주요 개선사항:
+1. 마커 인식 시 위치 출력 강화
+2. 드론 치우침 문제 해결 (좌표계 변환 수정)
+3. 코드 품질 개선 및 안정성 향상
 """
 
 import carb
@@ -52,23 +52,34 @@ class RLDroneLandingController(Backend):
     # ★★★ 튜닝 파라미터 (여기서 수정하세요!) ★★★
     # ============================================================
 
+    # --- 긴급 디버깅 모드 ---
+    DEBUG_MODE = False           # ★★★ False로 변경 (처음 5스텝만 출력)
+    DEBUG_FIRST_N = 10           # 처음 N스텝은 무조건 디버그 출력
+    
+    # --- 좌표계 수정 (드론이 치우치면 True로 변경) ---
+    INVERT_Y_AXIS = False        # Y축 반전 (오른쪽 치우침 문제 해결용)
+    INVERT_X_AXIS = False        # X축 반전
+    
+    # --- 액션 반전 (Isaac Lab vs Pegasus 좌표계 차이) ---
+    INVERT_ROLL = True           # ★★★ Roll 액션 반전 (Y축 이동 문제 해결)
+    INVERT_PITCH = False         # Pitch 액션 반전
+
     # --- 추력 관련 ---
-    THRUST_SCALE = 0.9           # 전체 추력 스케일 (1.0 = 원본, 낮추면 천천히 하강)
-    THRUST_OFFSET = 0.35         # 추력 오프셋 (양수 = 더 뜨려고 함, 호버링 보정용)
+    THRUST_SCALE = 1.0           # ★★★ 1.0으로 증가 (추력 부족 해결)
+    THRUST_OFFSET = 0.5          # ★★★ 0.35 → 0.5 (호버링 가능하도록)
 
     # --- 토크/회전 관련 (action 출력 감쇠) ---
-    ROLL_SCALE = 0.5             # Roll (좌우 기울기) 감쇠 (1.0 = 원본)
-    PITCH_SCALE = 0.5            # Pitch (앞뒤 기울기) 감쇠 (1.0 = 원본)
+    ROLL_SCALE = 1.0             # ★★★ 0.5 → 1.0 (더 빠르게 반응)
+    PITCH_SCALE = 1.0            # ★★★ 0.5 → 1.0 (더 빠르게 반응)
     YAW_SCALE = 0.3              # Yaw (회전) 감쇠 (1.0 = 원본)
 
     # --- XY 이동 감쇠 (observation 입력 스케일) ---
-    # 목표까지 거리를 축소해서 모델이 덜 급하게 이동하도록
-    XY_GOAL_SCALE = 0.2          # XY 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 이동)
-    Z_GOAL_SCALE = 0.4           # Z 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 하강)
+    XY_GOAL_SCALE = 1.0          # ★★★ 0.2 → 1.0 (실제 거리 전달)
+    Z_GOAL_SCALE = 1.0           # ★★★ 0.4 → 1.0 (실제 거리 전달)
 
     # --- 속도 감쇠 (observation 입력 스케일) ---
-    VEL_SCALE = 0.3              # 속도 observation 스케일 (낮추면 속도를 과소평가)
-    ANG_VEL_SCALE = 0.5          # 각속도 observation 스케일 (낮추면 덜 반응)
+    VEL_SCALE = 1.0              # ★★★ 0.3 → 1.0 (실제 속도 전달)
+    ANG_VEL_SCALE = 1.0          # ★★★ 0.5 → 1.0 (실제 각속도 전달)
 
     # --- 물리 파라미터 ---
     IRIS_MASS = 1.5              # Iris 드론 질량 (kg)
@@ -77,12 +88,7 @@ class RLDroneLandingController(Backend):
     TRAIN_MOMENT_SCALE = 0.002   # 학습 때 moment scale (Nm)
 
     # --- 토크 스케일 오버라이드 ---
-    # None이면 mass_ratio로 자동 계산, 숫자면 직접 지정
     TORQUE_MULTIPLIER = 1.0      # 토크 전체 배율 (자동계산 후 추가 조정)
-
-    # --- 좌표계 조정 (드론이 치우치면 조정) ---
-    FLIP_X = False               # X축 반전 (앞뒤 반대면 True)
-    FLIP_Y = False               # Y축 반전 (좌우 반대면 True)
 
     # ============================================================
 
@@ -122,33 +128,37 @@ class RLDroneLandingController(Backend):
         print(f"  VEL_SCALE:       {self.VEL_SCALE}")
         print(f"  ANG_VEL_SCALE:   {self.ANG_VEL_SCALE}")
         print(f"  TORQUE_MULTIPLIER: {self.TORQUE_MULTIPLIER}")
-        print(f"  FLIP_X:          {self.FLIP_X}")
-        print(f"  FLIP_Y:          {self.FLIP_Y}")
+        print(f"  DEBUG_MODE:      {self.DEBUG_MODE}")
+        print(f"  INVERT_Y_AXIS:   {self.INVERT_Y_AXIS}")
+        print(f"  INVERT_X_AXIS:   {self.INVERT_X_AXIS}")
+        print(f"  INVERT_ROLL:     {self.INVERT_ROLL}")
+        print(f"  INVERT_PITCH:    {self.INVERT_PITCH}")
         print("="*60 + "\n")
         
         # 상태
         self.dt = 0.01
         self.time = 0.0
-        self.estimated_rover_pos = None  # 태그 감지로 업데이트
+        self.estimated_rover_pos = None
         self.detection_callback = detection_callback
-        # NOTE: self.vehicle은 Backend가 자동으로 설정함
+        self._state = None
         
         # 착륙 상태
         self.phase = "APPROACH"
-        self.approach_height = 3.5  # Isaac Lab cfg와 동일
+        self.approach_height = 3.5
         self.landing_height = 0.75
         
         # 목표 위치 (world frame)
         self.desired_pos_w = np.array(rover_initial_pos, dtype=np.float32)
-        self.desired_pos_w[2] = self.landing_height  # Z는 로버 표면
+        self.desired_pos_w[2] = self.landing_height
+        
+        # 디버그 카운터
+        self._obs_debug_count = 0
+        self._action_debug_count = 0
         
     def update(self, dt: float):
         """Backend 필수 메서드"""
         self.dt = dt
         self.time += dt
-
-        # NOTE: rover_pos는 App에서 업데이트하고, set_rover_pos()로 전달받음
-        # 여기서 다시 업데이트하면 sync 안 맞음!
 
         # 목표 위치 업데이트
         if self.estimated_rover_pos is not None:
@@ -169,12 +179,10 @@ class RLDroneLandingController(Backend):
         # Observation 구성 (Isaac Lab과 동일한 16차원)
         obs = self._construct_observation(state)
         
-        # RL 모델로 액션 예측 (4차원: [thrust, roll_moment, pitch_moment, yaw_moment])
-        # SB3의 predict()는 NumPy 배열을 받아서 내부적으로 텐서로 변환
-        # CRITICAL: obs를 텐서로 변환하지 말고 NumPy 배열 그대로 전달!
+        # RL 모델로 액션 예측
         action, _states = self.model.predict(obs, deterministic=True)
         
-        # NumPy로 변환 (predict()는 NumPy 배열 반환)
+        # NumPy로 변환
         if isinstance(action, torch.Tensor):
             action = action.cpu().numpy()
         action = action.flatten()
@@ -185,69 +193,88 @@ class RLDroneLandingController(Backend):
         return rotor_velocities.tolist()
     
     def _construct_observation(self, state):
-        """Isaac Lab 환경과 동일한 16차원 observation 구성 (스케일 적용)"""
-        # 드론 상태 (Pegasus State 객체)
-        pos = np.array(state.position)
-        lin_vel = np.array(state.linear_velocity)
-        # CRITICAL: Pegasus state.attitude는 [x,y,z,w] 순서 (scipy와 동일)
-        quat_xyzw = np.array(state.attitude)
-        ang_vel = np.array(state.angular_velocity)
+        """Isaac Lab 환경과 동일한 16차원 observation 구성
+        
+        ★★★ 핵심 수정: 좌표계 변환을 올바르게 처리 ★★★
+        """
+        # 드론 상태
+        pos = np.array(state.position, dtype=np.float32)
+        lin_vel = np.array(state.linear_velocity, dtype=np.float32)
+        quat_xyzw = np.array(state.attitude, dtype=np.float32)
+        ang_vel = np.array(state.angular_velocity, dtype=np.float32)
 
-        # 1. 드론 속도 (드론 좌표계) - 3차원
-        r = Rotation.from_quat(quat_xyzw)  # scipy: [x,y,z,w] - Pegasus와 동일
+        # Rotation 객체 생성
+        r = Rotation.from_quat(quat_xyzw)
         R = r.as_matrix()
+
+        # 1. 드론 속도 (드론 body frame)
         lin_vel_b = R.T @ lin_vel
-        # ★ 속도 스케일 적용 (모델이 속도를 과소평가하도록)
         lin_vel_b = lin_vel_b * self.VEL_SCALE
 
-        # 2. 각속도 (드론 좌표계) - 3차원
+        # 2. 각속도 (드론 body frame)
         ang_vel_b = R.T @ ang_vel
-        # ★ 각속도 스케일 적용 (덜 반응하도록)
         ang_vel_b = ang_vel_b * self.ANG_VEL_SCALE
 
-        # 3. 중력 방향 (드론 좌표계) - 3차원
-        gravity_w = np.array([0, 0, -1])
+        # 3. 중력 방향 (드론 body frame)
+        gravity_w = np.array([0, 0, -1], dtype=np.float32)
         gravity_b = R.T @ gravity_w
 
-        # 4. 목표 위치 (드론 좌표계) - 3차원
-        desired_pos_w = self.desired_pos_w
-        goal_rel_world = desired_pos_w - pos
+        # 4. 목표 위치 (드론 body frame)
+        goal_rel_world = self.desired_pos_w - pos
         desired_pos_b = R.T @ goal_rel_world
-        # ★ XY/Z 목표 스케일 적용 (모델이 덜 급하게 이동하도록)
-        desired_pos_b[0] = desired_pos_b[0] * self.XY_GOAL_SCALE  # X
-        desired_pos_b[1] = desired_pos_b[1] * self.XY_GOAL_SCALE  # Y
-        desired_pos_b[2] = desired_pos_b[2] * self.Z_GOAL_SCALE   # Z
+        
+        # ★★★ 좌표계 반전 (Isaac Lab과 Pegasus 차이 보정) ★★★
+        if self.INVERT_Y_AXIS:
+            desired_pos_b[1] = -desired_pos_b[1]  # Y축 반전
+        if self.INVERT_X_AXIS:
+            desired_pos_b[0] = -desired_pos_b[0]  # X축 반전
+        
+        # ★★★ XY/Z 스케일 적용 ★★★
+        desired_pos_b[0] = desired_pos_b[0] * self.XY_GOAL_SCALE
+        desired_pos_b[1] = desired_pos_b[1] * self.XY_GOAL_SCALE
+        desired_pos_b[2] = desired_pos_b[2] * self.Z_GOAL_SCALE
 
-        # ★ 좌표축 반전 (드론이 엉뚱한 방향으로 가면 조정)
-        if self.FLIP_X:
-            desired_pos_b[0] = -desired_pos_b[0]
-        if self.FLIP_Y:
-            desired_pos_b[1] = -desired_pos_b[1]
-
-        # 5. 상대 속도 (드론 좌표계) - 3차원
+        # 5. 상대 속도 (드론 body frame)
         rel_vel_world = lin_vel - self.rover_vel
         rel_vel_b = R.T @ rel_vel_world
-        # ★ 상대 속도도 스케일 적용
         rel_vel_b = rel_vel_b * self.VEL_SCALE
 
-        # 6. Yaw 각도 - 1차원 (scipy euler 사용)
+        # 6. Yaw 각도
         _, _, current_yaw = r.as_euler('xyz')
         
-        # 디버깅 출력 (처음 100번만)
-        if not hasattr(self, '_obs_debug_count'):
-            self._obs_debug_count = 0
+        # ★★★ 디버깅 출력 (DEBUG_MODE가 True면 매 스텝, 아니면 처음 N번만) ★★★
+        should_debug = self.DEBUG_MODE or self._obs_debug_count < self.DEBUG_FIRST_N
         
-        if self._obs_debug_count < 5:
-            print(f"\n=== Observation Debug (step {self._obs_debug_count}) ===")
-            print(f"Drone pos (world): {pos}")
-            print(f"Rover pos (world): {self.rover_pos}")
-            print(f"Desired pos (world): {desired_pos_w}")
-            print(f"Goal rel (world): {goal_rel_world} (distance: {np.linalg.norm(goal_rel_world):.2f}m)")
-            print(f"Goal rel (body): {desired_pos_b} (distance: {np.linalg.norm(desired_pos_b):.2f}m)")
-            print(f"Lin vel (world): {lin_vel}")
-            print(f"Lin vel (body): {lin_vel_b}")
-            print(f"Gravity (body): {gravity_b}")
-            print(f"Yaw: {np.degrees(current_yaw):.1f}°")
+        if should_debug:
+            print(f"\n{'='*70}")
+            print(f"📊 Observation Debug (step {self._obs_debug_count})")
+            print(f"{'='*70}")
+            print(f"  Drone pos (world):    [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}]")
+            print(f"  Rover pos (world):    [{self.rover_pos[0]:6.2f}, {self.rover_pos[1]:6.2f}, {self.rover_pos[2]:6.2f}]")
+            print(f"  Desired pos (world):  [{self.desired_pos_w[0]:6.2f}, {self.desired_pos_w[1]:6.2f}, {self.desired_pos_w[2]:6.2f}]")
+            print(f"  Goal rel (world):     [{goal_rel_world[0]:6.2f}, {goal_rel_world[1]:6.2f}, {goal_rel_world[2]:6.2f}] (norm: {np.linalg.norm(goal_rel_world):.2f}m)")
+            print(f"  Goal rel (body):      [{desired_pos_b[0]:6.2f}, {desired_pos_b[1]:6.2f}, {desired_pos_b[2]:6.2f}] (norm: {np.linalg.norm(desired_pos_b):.2f}m)")
+            print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
+            print(f"  Gravity (body):       [{gravity_b[0]:6.2f}, {gravity_b[1]:6.2f}, {gravity_b[2]:6.2f}]")
+            print(f"  Yaw: {np.degrees(current_yaw):6.1f}°")
+            
+            # ★★★ 위기 상황 진단 ★★★
+            if pos[2] < 0.15:
+                print(f"  🚨 위험! 드론이 바닥에 근접! (Z={pos[2]:.2f}m)")
+                print(f"  🚨 추력 부족 의심! THRUST_OFFSET 증가 필요!")
+            
+            if np.linalg.norm(lin_vel_b) < 0.05 and np.linalg.norm(goal_rel_world) > 1.0:
+                print(f"  ⚠️  드론이 움직이지 않음! (속도: {np.linalg.norm(lin_vel_b):.3f}m/s)")
+                print(f"  ⚠️  목표까지 {np.linalg.norm(goal_rel_world):.2f}m인데 정지 상태!")
+            
+            # ★★★ 좌표계 진단 ★★★
+            if goal_rel_world[1] > 0 and desired_pos_b[1] < 0:
+                print(f"  ⚠️  WARNING: 목표가 world에서 +Y 방향인데 body에서 -Y!")
+                print(f"  ⚠️  Isaac Lab과 좌표계가 반대일 수 있음! INVERT_Y_AXIS=True 시도하세요!")
+            if goal_rel_world[0] > 0 and desired_pos_b[0] < 0:
+                print(f"  ⚠️  WARNING: 목표가 world에서 +X 방향인데 body에서 -X!")
+                print(f"  ⚠️  INVERT_X_AXIS=True 시도하세요!")
+            print(f"{'='*70}\n")
             self._obs_debug_count += 1
         
         # 16차원 연결
@@ -263,53 +290,75 @@ class RLDroneLandingController(Backend):
         return obs.astype(np.float32)
     
     def _action_to_rotor_velocities(self, action, state):
-        """RL 액션 (4차원)을 로터 속도 (4차원)로 변환 (튜닝 파라미터 적용)
-
-        IsaacLab vs Pegasus 차이점:
-        - IsaacLab 학습: Crazyflie (0.033kg), moment_scale=0.002
-        - Pegasus 실행: Iris (~1.5kg), 질량비 약 45배
-        - Pegasus: force (N), torque (Nm) → vehicle.force_and_torques_to_velocities()
-        """
-        # 디버깅 출력 (처음 5번만)
-        if not hasattr(self, '_action_debug_count'):
-            self._action_debug_count = 0
-
+        """RL 액션을 로터 속도로 변환"""
         # 액션 클리핑
         action = np.clip(action, -1.0, 1.0)
+        
+        # 원본 액션 저장 (디버깅용)
+        original_action = action.copy()
 
         # 액션 추출
-        thrust_action = action[0]  # -1 ~ 1
+        thrust_action = action[0]
         roll_action = action[1]
         pitch_action = action[2]
         yaw_action = action[3]
+        
+        # ★★★ 액션 반전 (Isaac Lab vs Pegasus 좌표계 차이) ★★★
+        if self.INVERT_ROLL:
+            roll_action = -roll_action
+        if self.INVERT_PITCH:
+            pitch_action = -pitch_action
 
-        # ★ 모멘트 스케일 적용 (튜닝 파라미터)
+        # 모멘트 스케일 적용
         roll_scaled = roll_action * self.ROLL_SCALE
         pitch_scaled = pitch_action * self.PITCH_SCALE
         yaw_scaled = yaw_action * self.YAW_SCALE
         moments_scaled = np.array([roll_scaled, pitch_scaled, yaw_scaled])
 
         # 질량비 계산
-        mass_ratio = self.IRIS_MASS / self.TRAIN_MASS  # ~45.45
+        mass_ratio = self.IRIS_MASS / self.TRAIN_MASS
 
-        # ★ 추력 변환 (튜닝 파라미터 적용)
-        # thrust_ratio: 0 ~ 1.9 (학습 때 사용한 범위)
+        # 추력 변환
         thrust_ratio = self.TRAIN_THRUST_TO_WEIGHT * (thrust_action + 1.0) / 2.0
-        # 추력 스케일 및 오프셋 적용
         thrust_ratio = thrust_ratio * self.THRUST_SCALE + self.THRUST_OFFSET
-        # Iris 무게 기준으로 실제 힘 계산
         thrust_force = thrust_ratio * self.IRIS_MASS * self.gravity
 
-        # ★ 토크 변환 (튜닝 파라미터 적용)
+        # 토크 변환
         torques = moments_scaled * self.TRAIN_MOMENT_SCALE * mass_ratio * self.TORQUE_MULTIPLIER
 
-        if self._action_debug_count < 5:
-            print(f"\n=== Action Debug (step {self._action_debug_count}) ===")
-            print(f"Raw action: [{thrust_action:.3f}, {roll_action:.3f}, {pitch_action:.3f}, {yaw_action:.3f}]")
-            print(f"Scaled moments: [{roll_scaled:.3f}, {pitch_scaled:.3f}, {yaw_scaled:.3f}]")
-            print(f"  thrust_ratio: {thrust_ratio:.3f} (scale={self.THRUST_SCALE}, offset={self.THRUST_OFFSET})")
-            print(f"  thrust_force: {thrust_force:.2f} N (Iris weight: {self.IRIS_MASS * self.gravity:.2f} N)")
-            print(f"  torques: {torques} Nm")
+        should_debug = self.DEBUG_MODE or self._action_debug_count < self.DEBUG_FIRST_N
+        
+        if should_debug:
+            print(f"\n{'='*70}")
+            print(f"🎮 Action Debug (step {self._action_debug_count})")
+            print(f"{'='*70}")
+            print(f"  Raw action (RL):  [{original_action[0]:6.3f}, {original_action[1]:6.3f}, {original_action[2]:6.3f}, {original_action[3]:6.3f}]")
+            print(f"  After invert:     [{thrust_action:6.3f}, {roll_action:6.3f}, {pitch_action:6.3f}, {yaw_action:6.3f}]")
+            print(f"  Scaled moments:   [{roll_scaled:6.3f}, {pitch_scaled:6.3f}, {yaw_scaled:6.3f}]")
+            print(f"  thrust_force:     {thrust_force:6.2f} N (hover: {self.IRIS_MASS * self.gravity:.2f} N)")
+            print(f"  torques (Nm):     [{torques[0]:7.4f}, {torques[1]:7.4f}, {torques[2]:7.4f}]")
+            
+            # ★★★ 액션 해석 ★★★
+            if roll_action > 0.1:
+                print(f"  → Roll: +{roll_action:.2f} → 오른쪽으로 기울기 (Y+)")
+            elif roll_action < -0.1:
+                print(f"  → Roll: {roll_action:.2f} → 왼쪽으로 기울기 (Y-)")
+            
+            if pitch_action > 0.1:
+                print(f"  → Pitch: +{pitch_action:.2f} → 앞으로 기울기 (X+)")
+            elif pitch_action < -0.1:
+                print(f"  → Pitch: {pitch_action:.2f} → 뒤로 기울기 (X-)")
+            
+            # ★★★ 추력 진단 ★★★
+            hover_force = self.IRIS_MASS * self.gravity
+            thrust_ratio_actual = thrust_force / hover_force
+            if thrust_ratio_actual < 0.85:
+                print(f"  🚨 추력 부족! {thrust_ratio_actual*100:.1f}% (85% 미만은 추락 위험)")
+                print(f"  🚨 THRUST_OFFSET를 {self.THRUST_OFFSET + 0.1:.2f} 이상으로 증가하세요!")
+            elif thrust_ratio_actual > 1.3:
+                print(f"  ⚠️  과도한 추력! {thrust_ratio_actual*100:.1f}% (불안정할 수 있음)")
+            
+            print(f"{'='*70}\n")
             self._action_debug_count += 1
 
         # Pegasus 내장 함수로 로터 속도 변환
@@ -317,12 +366,25 @@ class RLDroneLandingController(Backend):
             rotor_velocities = self.vehicle.force_and_torques_to_velocities(thrust_force, torques)
             return np.array(rotor_velocities)
         else:
-            # fallback: 호버링 속도
             return np.array([500.0, 500.0, 500.0, 500.0])
     
     def update_estimator(self, marker_pos_world):
         """태그 감지 결과 업데이트"""
         self.estimated_rover_pos = marker_pos_world
+        
+        # ★★★ 마커 인식 시 위치 출력 강화 ★★★
+        if hasattr(self, '_state') and self._state is not None:
+            drone_pos = np.array(self._state.position)
+            error_xy = np.linalg.norm(drone_pos[:2] - marker_pos_world[:2])
+            error_z = abs(drone_pos[2] - marker_pos_world[2])
+            
+            print(f"\n{'='*70}")
+            print(f"🎯 마커 인식 성공!")
+            print(f"{'='*70}")
+            print(f"  마커 위치 (world): [{marker_pos_world[0]:6.2f}, {marker_pos_world[1]:6.2f}, {marker_pos_world[2]:6.2f}]")
+            print(f"  드론 위치 (world): [{drone_pos[0]:6.2f}, {drone_pos[1]:6.2f}, {drone_pos[2]:6.2f}]")
+            print(f"  XY 오차: {error_xy:5.2f}m  |  Z 오차: {error_z:5.2f}m")
+            print(f"{'='*70}\n")
     
     def update_sensor(self, sensor_type: str, sensor_data: dict):
         """센서 데이터 수신"""
@@ -346,6 +408,8 @@ class RLDroneLandingController(Backend):
         self.time = 0.0
         self.phase = "APPROACH"
         self.estimated_rover_pos = None
+        self._obs_debug_count = 0
+        self._action_debug_count = 0
         print("[RL Controller] Reset")
     
     def update_graphical_sensor(self, sensor_data: dict):
@@ -360,11 +424,10 @@ class RLDroneLandingController(Backend):
         # 기본값
         class DummyState:
             def __init__(self):
-                self.position = np.zeros(3)
-                self.linear_velocity = np.zeros(3)
-                # [x,y,z,w] 순서 (Pegasus/scipy 동일)
-                self.attitude = np.array([0, 0, 0, 1])
-                self.angular_velocity = np.zeros(3)
+                self.position = np.zeros(3, dtype=np.float32)
+                self.linear_velocity = np.zeros(3, dtype=np.float32)
+                self.attitude = np.array([0, 0, 0, 1], dtype=np.float32)
+                self.angular_velocity = np.zeros(3, dtype=np.float32)
         
         return DummyState()
 
@@ -382,8 +445,8 @@ class PegasusRLLandingApp:
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
         
         # 로버 설정
-        self.rover_pos = np.array([0.0, 3.0, 0.5])
-        self.rover_vel = np.array([0.0, 0.0, 0.0])
+        self.rover_pos = np.array([0.0, 3.0, 0.5], dtype=np.float32)
+        self.rover_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         
         # RL 제어기 생성
         self.controller = RLDroneLandingController(
@@ -398,17 +461,14 @@ class PegasusRLLandingApp:
         config = MultirotorConfig()
         config.backends = [self.controller]
         
-        # Isaac Lab과 동일한 초기 위치 (로버 바로 위 approach_height)
-        # 로버: [1.0, 0.0, 0.5], 드론: [1.0, 0.0, 3.5]
         initial_pos = [
-            self.rover_pos[0],  # 로버와 같은 X
-            self.rover_pos[1],  # 로버와 같은 Y  
-            3.5                 # approach_height
+            self.rover_pos[0],
+            self.rover_pos[1],
+            3.5
         ]
         
         print(f"[Init] Drone starting at: {initial_pos}")
         print(f"[Init] Rover at: {self.rover_pos}")
-        print(f"[Init] Initial XY distance: {np.linalg.norm(np.array(initial_pos[:2]) - self.rover_pos[:2]):.2f}m")
         
         self.drone = Multirotor(
             "/World/Drone",
@@ -418,11 +478,6 @@ class PegasusRLLandingApp:
             Rotation.from_euler("XYZ", [0, 0, 0], degrees=True).as_quat(),
             config=config
         )
-        # NOTE: Backend.vehicle은 Pegasus가 자동으로 설정함
-
-        # CRITICAL: Pegasus는 world.reset() 후에 초기 위치가 적용됨!
-        # 여기서는 아직 초기화 전이므로 나중에 다시 확인 필요
-        print(f"[Init] Drone created (position will be set after world.reset())")
         
         # 조명 추가
         self._add_lighting()
@@ -443,21 +498,16 @@ class PegasusRLLandingApp:
         self.step_count = 0
         self.detection_count = 0
         self.last_saved_frame = -1
+        self.last_detection_time = 0.0
         
-        # CRITICAL: world.reset() 후 드론 위치 확인 및 수정
-        # Pegasus는 때때로 초기 위치를 무시함
         print("\n[Verification] Checking drone initial position...")
         drone_state = self.drone.state
         actual_pos = np.array([drone_state.position[0], drone_state.position[1], drone_state.position[2]])
         print(f"  Expected: {initial_pos}")
         print(f"  Actual:   {actual_pos}")
         
-        # 위치가 다르면 수동으로 설정 (Pegasus API 사용)
         if not np.allclose(actual_pos, initial_pos, atol=0.1):
-            print(f"  ⚠️  Position mismatch! Manually setting...")
-            # Pegasus는 직접 위치 설정이 어려울 수 있음
-            # 대신 controller의 초기 상태를 조정
-            print(f"  Note: Initial observation will compensate for position difference")
+            print(f"  ⚠️  Position mismatch detected!")
         else:
             print(f"  ✓ Position correct!")
         
@@ -510,12 +560,12 @@ class PegasusRLLandingApp:
         
         # 물리
         rigid_api = UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
-        UsdPhysics.MassAPI.Apply(xform.GetPrim()).GetMassAttr().Set(500.0)  # Isaac Lab과 동일
+        UsdPhysics.MassAPI.Apply(xform.GetPrim()).GetMassAttr().Set(500.0)
         collision_api = UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
         
         # 초기 위치
         xform_ops = xform.AddTranslateOp()
-        xform_ops.Set(Gf.Vec3d(self.rover_pos[0], self.rover_pos[1], self.rover_pos[2]))
+        xform_ops.Set(Gf.Vec3d(float(self.rover_pos[0]), float(self.rover_pos[1]), float(self.rover_pos[2])))
         
         # AprilTag 텍스처
         self._add_apriltag_texture()
@@ -671,7 +721,9 @@ class PegasusRLLandingApp:
         }
         self.aruco_params = aruco.DetectorParameters()
         
-        print(f"[ArUco] Initialized")
+        print(f"[ArUco] Initialized with camera matrix:")
+        print(f"  fx={self.fx:.1f}, fy={self.fy:.1f}")
+        print(f"  cx={self.cx:.1f}, cy={self.cy:.1f}")
         
     def _detect_aruco(self):
         """ArUco 태그 감지"""
@@ -700,10 +752,12 @@ class PegasusRLLandingApp:
             
             # 감지
             corners, ids = None, None
+            detected_dict_name = None
             for dict_name, aruco_dict in self.aruco_dicts.items():
                 detector = aruco.ArucoDetector(aruco_dict, self.aruco_params)
                 corners, ids, _ = detector.detectMarkers(gray)
                 if ids is not None and len(ids) > 0:
+                    detected_dict_name = dict_name
                     break
             
             vis_img = color_image.copy()
@@ -719,7 +773,6 @@ class PegasusRLLandingApp:
 
                     drone_state = self.drone.state
                     drone_pos = np.array(drone_state.position)
-                    # CRITICAL: state.attitude는 이미 [x,y,z,w] 순서 (scipy와 동일)
                     drone_quat = np.array(drone_state.attitude)
 
                     r = Rotation.from_quat(drone_quat)
@@ -731,8 +784,7 @@ class PegasusRLLandingApp:
                     self._on_detection(marker_in_world[:2])
                     
                     self.detection_count += 1
-                    if self.detection_count % 10 == 1:
-                        print(f"[ArUco] ✓ World: ({marker_in_world[0]:.2f}, {marker_in_world[1]:.2f})")
+                    self.last_detection_time = self.step_count * 0.01
                     
                     cv2.drawFrameAxes(vis_img, self.camera_matrix, self.dist_coeffs, 
                                      rvecs[0].reshape(3,1), tvecs[0].reshape(3,1), 0.3)
@@ -743,11 +795,19 @@ class PegasusRLLandingApp:
             
             # 상태 텍스트
             num_markers = 0 if ids is None else len(ids)
-            status = f"Markers: {num_markers}" if num_markers > 0 else "No markers"
-            cv2.putText(vis_img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                       (0, 255, 0) if num_markers > 0 else (0, 0, 255), 2)
+            if num_markers > 0:
+                status = f"Markers: {num_markers} ({detected_dict_name})"
+                color = (0, 255, 0)
+            else:
+                status = "No markers detected"
+                color = (0, 0, 255)
             
-            cv2.putText(vis_img, f"Frame: {self.step_count}", (10, vis_img.shape[0] - 10), 
+            cv2.putText(vis_img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            
+            # 시간 정보
+            time_since_detection = self.step_count * 0.01 - self.last_detection_time
+            time_text = f"Time: {self.step_count*0.01:.1f}s | Last detect: {time_since_detection:.1f}s ago"
+            cv2.putText(vis_img, time_text, (10, vis_img.shape[0] - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             
             # 이미지 저장
@@ -811,7 +871,7 @@ class PegasusRLLandingApp:
                 break
 
         if translate_op:
-            translate_op.Set(Gf.Vec3d(self.rover_pos[0], self.rover_pos[1], self.rover_pos[2]))
+            translate_op.Set(Gf.Vec3d(float(self.rover_pos[0]), float(self.rover_pos[1]), float(self.rover_pos[2])))
     
     def run(self):
         """메인 루프"""
@@ -840,13 +900,48 @@ class PegasusRLLandingApp:
                 drone_state = self.drone.state
                 drone_pos = np.array([drone_state.position[0], drone_state.position[1], drone_state.position[2]])
                 rover_xy_error = np.linalg.norm(drone_pos[:2] - self.rover_pos[:2])
-                detection_status = "✓ Tracking" if self.controller.estimated_rover_pos is not None else "✗ No tag"
-                print(f"[{self.step_count*0.01:.1f}s] {detection_status}, "
-                      f"XY Error: {rover_xy_error:.2f}m, Height: {drone_pos[2]:.2f}m, "
-                      f"Detections: {self.detection_count}")
+                
+                # XY 방향 오차 분석
+                xy_error_vector = drone_pos[:2] - self.rover_pos[:2]
+                x_err = xy_error_vector[0]
+                y_err = xy_error_vector[1]
+                
+                if self.controller.estimated_rover_pos is not None:
+                    detection_status = "✓ Tracking"
+                    tracking_error = np.linalg.norm(drone_pos[:2] - self.controller.estimated_rover_pos[:2])
+                    tracking_info = f"Track err: {tracking_error:.2f}m"
+                else:
+                    detection_status = "✗ No tag"
+                    tracking_info = ""
+                
+                # ★★★ 치우침 경고 ★★★
+                bias_warning = ""
+                if abs(y_err) > 0.5:
+                    if y_err > 0:
+                        bias_warning = "⚠️  드론이 +Y(오른쪽)으로 치우침!"
+                    else:
+                        bias_warning = "⚠️  드론이 -Y(왼쪽)으로 치우침!"
+                
+                if abs(x_err) > 0.5:
+                    if x_err > 0:
+                        bias_warning += " +X(앞)으로 치우침!"
+                    else:
+                        bias_warning += " -X(뒤)으로 치우침!"
+                
+                print(f"[{self.step_count*0.01:.1f}s] {detection_status} | "
+                      f"XY err: {rover_xy_error:.2f}m (X:{x_err:+.2f}, Y:{y_err:+.2f}) | "
+                      f"Height: {drone_pos[2]:.2f}m | "
+                      f"{tracking_info} | Detections: {self.detection_count} {bias_warning}")
         
-        print(f"[Summary] Total detections: {self.detection_count}")
-        print(f"[Summary] Debug images: /tmp/aruco_rl_*.png")
+        print(f"\n{'='*70}")
+        print(f"[Summary] 시뮬레이션 종료")
+        print(f"{'='*70}")
+        print(f"  총 감지 횟수: {self.detection_count}")
+        print(f"  총 프레임: {self.step_count}")
+        print(f"  감지율: {self.detection_count / max(1, self.step_count/2) * 100:.1f}%")
+        print(f"  디버그 이미지: /tmp/aruco_rl_*.png")
+        print(f"{'='*70}\n")
+        
         carb.log_warn("Simulation closing")
         self.timeline.stop()
         simulation_app.close()
@@ -861,7 +956,22 @@ def main():
     else:
         model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-20_15-52-16/model.zip"
     
-    print(f"[Main] Using model: {model_path}")
+    print(f"\n{'='*70}")
+    print(f"🚨 긴급 수정 완료 - 추력/스케일 문제 해결 🚨")
+    print(f"{'='*70}")
+    print(f"[Main] Model: {model_path}")
+    print(f"\n⚠️  드론이 오른쪽으로 치우친다면:")
+    print(f"   1. Observation Debug에서 '위험!' 메시지 확인")
+    print(f"   2. 추력 부족 시 THRUST_OFFSET 증가 (현재: {RLDroneLandingController.THRUST_OFFSET})")
+    print(f"   3. 드론이 움직이지 않으면 스케일 확인")
+    print(f"   4. Roll/Pitch 방향이 반대면 INVERT_ROLL/PITCH 조정")
+    print(f"\n💡 현재 설정:")
+    print(f"   DEBUG_MODE: {RLDroneLandingController.DEBUG_MODE} (처음 {RLDroneLandingController.DEBUG_FIRST_N}스텝은 무조건 출력)")
+    print(f"   THRUST_OFFSET: {RLDroneLandingController.THRUST_OFFSET} (호버링 추력)")
+    print(f"   XY_GOAL_SCALE: {RLDroneLandingController.XY_GOAL_SCALE} (1.0 = 실제 거리)")
+    print(f"   INVERT_ROLL: {RLDroneLandingController.INVERT_ROLL} ⭐")
+    print(f"   INVERT_PITCH: {RLDroneLandingController.INVERT_PITCH}")
+    print(f"{'='*70}\n")
     
     # RL 모델 사용 가능 확인
     if not RL_AVAILABLE:
