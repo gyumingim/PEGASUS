@@ -53,8 +53,7 @@ class RLDroneLandingController(Backend):
     # ============================================================
 
     # --- 긴급 디버깅 모드 ---
-    DEBUG_MODE = False           # ★★★ False로 변경 (처음 5스텝만 출력)
-    DEBUG_FIRST_N = 10           # 처음 N스텝은 무조건 디버그 출력
+    DEBUG_MODE = True            # True로 설정하면 매 스텝 상세 출력
     
     # --- 좌표계 수정 (드론이 치우치면 True로 변경) ---
     INVERT_Y_AXIS = False        # Y축 반전 (오른쪽 치우침 문제 해결용)
@@ -65,21 +64,21 @@ class RLDroneLandingController(Backend):
     INVERT_PITCH = False         # Pitch 액션 반전
 
     # --- 추력 관련 ---
-    THRUST_SCALE = 1.0           # ★★★ 1.0으로 증가 (추력 부족 해결)
-    THRUST_OFFSET = 0.5          # ★★★ 0.35 → 0.5 (호버링 가능하도록)
+    THRUST_SCALE = 0.9           # 전체 추력 스케일 (1.0 = 원본, 낮추면 천천히 하강)
+    THRUST_OFFSET = 0.35         # 추력 오프셋 (양수 = 더 뜨려고 함, 호버링 보정용)
 
     # --- 토크/회전 관련 (action 출력 감쇠) ---
-    ROLL_SCALE = 1.0             # ★★★ 0.5 → 1.0 (더 빠르게 반응)
-    PITCH_SCALE = 1.0            # ★★★ 0.5 → 1.0 (더 빠르게 반응)
+    ROLL_SCALE = 0.5             # Roll (좌우 기울기) 감쇠 (1.0 = 원본)
+    PITCH_SCALE = 0.5            # Pitch (앞뒤 기울기) 감쇠 (1.0 = 원본)
     YAW_SCALE = 0.3              # Yaw (회전) 감쇠 (1.0 = 원본)
 
     # --- XY 이동 감쇠 (observation 입력 스케일) ---
-    XY_GOAL_SCALE = 1.0          # ★★★ 0.2 → 1.0 (실제 거리 전달)
-    Z_GOAL_SCALE = 1.0           # ★★★ 0.4 → 1.0 (실제 거리 전달)
+    XY_GOAL_SCALE = 0.2          # XY 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 이동)
+    Z_GOAL_SCALE = 0.4           # Z 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 하강)
 
     # --- 속도 감쇠 (observation 입력 스케일) ---
-    VEL_SCALE = 1.0              # ★★★ 0.3 → 1.0 (실제 속도 전달)
-    ANG_VEL_SCALE = 1.0          # ★★★ 0.5 → 1.0 (실제 각속도 전달)
+    VEL_SCALE = 0.3              # 속도 observation 스케일 (낮추면 속도를 과소평가)
+    ANG_VEL_SCALE = 0.5          # 각속도 observation 스케일 (낮추면 덜 반응)
 
     # --- 물리 파라미터 ---
     IRIS_MASS = 1.5              # Iris 드론 질량 (kg)
@@ -242,10 +241,8 @@ class RLDroneLandingController(Backend):
         # 6. Yaw 각도
         _, _, current_yaw = r.as_euler('xyz')
         
-        # ★★★ 디버깅 출력 (DEBUG_MODE가 True면 매 스텝, 아니면 처음 N번만) ★★★
-        should_debug = self.DEBUG_MODE or self._obs_debug_count < self.DEBUG_FIRST_N
-        
-        if should_debug:
+        # ★★★ 디버깅 출력 (DEBUG_MODE가 True면 매 스텝 출력) ★★★
+        if self.DEBUG_MODE or self._obs_debug_count < 5:
             print(f"\n{'='*70}")
             print(f"📊 Observation Debug (step {self._obs_debug_count})")
             print(f"{'='*70}")
@@ -257,15 +254,6 @@ class RLDroneLandingController(Backend):
             print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
             print(f"  Gravity (body):       [{gravity_b[0]:6.2f}, {gravity_b[1]:6.2f}, {gravity_b[2]:6.2f}]")
             print(f"  Yaw: {np.degrees(current_yaw):6.1f}°")
-            
-            # ★★★ 위기 상황 진단 ★★★
-            if pos[2] < 0.15:
-                print(f"  🚨 위험! 드론이 바닥에 근접! (Z={pos[2]:.2f}m)")
-                print(f"  🚨 추력 부족 의심! THRUST_OFFSET 증가 필요!")
-            
-            if np.linalg.norm(lin_vel_b) < 0.05 and np.linalg.norm(goal_rel_world) > 1.0:
-                print(f"  ⚠️  드론이 움직이지 않음! (속도: {np.linalg.norm(lin_vel_b):.3f}m/s)")
-                print(f"  ⚠️  목표까지 {np.linalg.norm(goal_rel_world):.2f}m인데 정지 상태!")
             
             # ★★★ 좌표계 진단 ★★★
             if goal_rel_world[1] > 0 and desired_pos_b[1] < 0:
@@ -326,9 +314,7 @@ class RLDroneLandingController(Backend):
         # 토크 변환
         torques = moments_scaled * self.TRAIN_MOMENT_SCALE * mass_ratio * self.TORQUE_MULTIPLIER
 
-        should_debug = self.DEBUG_MODE or self._action_debug_count < self.DEBUG_FIRST_N
-        
-        if should_debug:
+        if self.DEBUG_MODE or self._action_debug_count < 5:
             print(f"\n{'='*70}")
             print(f"🎮 Action Debug (step {self._action_debug_count})")
             print(f"{'='*70}")
@@ -348,15 +334,6 @@ class RLDroneLandingController(Backend):
                 print(f"  → Pitch: +{pitch_action:.2f} → 앞으로 기울기 (X+)")
             elif pitch_action < -0.1:
                 print(f"  → Pitch: {pitch_action:.2f} → 뒤로 기울기 (X-)")
-            
-            # ★★★ 추력 진단 ★★★
-            hover_force = self.IRIS_MASS * self.gravity
-            thrust_ratio_actual = thrust_force / hover_force
-            if thrust_ratio_actual < 0.85:
-                print(f"  🚨 추력 부족! {thrust_ratio_actual*100:.1f}% (85% 미만은 추락 위험)")
-                print(f"  🚨 THRUST_OFFSET를 {self.THRUST_OFFSET + 0.1:.2f} 이상으로 증가하세요!")
-            elif thrust_ratio_actual > 1.3:
-                print(f"  ⚠️  과도한 추력! {thrust_ratio_actual*100:.1f}% (불안정할 수 있음)")
             
             print(f"{'='*70}\n")
             self._action_debug_count += 1
@@ -957,19 +934,19 @@ def main():
         model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-20_15-52-16/model.zip"
     
     print(f"\n{'='*70}")
-    print(f"🚨 긴급 수정 완료 - 추력/스케일 문제 해결 🚨")
+    print(f"🚨 긴급 디버깅 모드 - 드론 치우침 문제 진단 🚨")
     print(f"{'='*70}")
     print(f"[Main] Model: {model_path}")
     print(f"\n⚠️  드론이 오른쪽으로 치우친다면:")
-    print(f"   1. Observation Debug에서 '위험!' 메시지 확인")
-    print(f"   2. 추력 부족 시 THRUST_OFFSET 증가 (현재: {RLDroneLandingController.THRUST_OFFSET})")
-    print(f"   3. 드론이 움직이지 않으면 스케일 확인")
-    print(f"   4. Roll/Pitch 방향이 반대면 INVERT_ROLL/PITCH 조정")
+    print(f"   1. Observation Debug에서 'WARNING' 메시지 확인")
+    print(f"   2. Goal rel (world)와 (body)의 부호 비교")
+    print(f"   3. INVERT_Y_AXIS=True 또는 INVERT_X_AXIS=True로 변경")
+    print(f"   4. Action Debug에서 Roll/Pitch 방향 확인")
     print(f"\n💡 현재 설정:")
-    print(f"   DEBUG_MODE: {RLDroneLandingController.DEBUG_MODE} (처음 {RLDroneLandingController.DEBUG_FIRST_N}스텝은 무조건 출력)")
-    print(f"   THRUST_OFFSET: {RLDroneLandingController.THRUST_OFFSET} (호버링 추력)")
-    print(f"   XY_GOAL_SCALE: {RLDroneLandingController.XY_GOAL_SCALE} (1.0 = 실제 거리)")
-    print(f"   INVERT_ROLL: {RLDroneLandingController.INVERT_ROLL} ⭐")
+    print(f"   DEBUG_MODE: {RLDroneLandingController.DEBUG_MODE}")
+    print(f"   INVERT_Y_AXIS: {RLDroneLandingController.INVERT_Y_AXIS}")
+    print(f"   INVERT_X_AXIS: {RLDroneLandingController.INVERT_X_AXIS}")
+    print(f"   INVERT_ROLL: {RLDroneLandingController.INVERT_ROLL} ⭐ 오른쪽 치우침 해결!")
     print(f"   INVERT_PITCH: {RLDroneLandingController.INVERT_PITCH}")
     print(f"{'='*70}\n")
     
