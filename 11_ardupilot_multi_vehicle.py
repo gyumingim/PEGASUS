@@ -54,7 +54,7 @@ class RLDroneLandingController(Backend):
 
     # --- 추력 관련 ---
     THRUST_SCALE = 0.9           # 전체 추력 스케일 (1.0 = 원본, 낮추면 천천히 하강)
-    THRUST_OFFSET = 0.05         # 추력 오프셋 (양수 = 더 뜨려고 함, 호버링 보정용)
+    THRUST_OFFSET = 0.35         # 추력 오프셋 (양수 = 더 뜨려고 함, 호버링 보정용)
 
     # --- 토크/회전 관련 (action 출력 감쇠) ---
     ROLL_SCALE = 0.5             # Roll (좌우 기울기) 감쇠 (1.0 = 원본)
@@ -63,11 +63,12 @@ class RLDroneLandingController(Backend):
 
     # --- XY 이동 감쇠 (observation 입력 스케일) ---
     # 목표까지 거리를 축소해서 모델이 덜 급하게 이동하도록
-    XY_GOAL_SCALE = 0.6          # XY 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 이동)
+    XY_GOAL_SCALE = 0.2          # XY 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 이동)
     Z_GOAL_SCALE = 0.4           # Z 목표 거리 감쇠 (1.0 = 원본, 낮추면 천천히 하강)
 
     # --- 속도 감쇠 (observation 입력 스케일) ---
-    VEL_SCALE = 0.8              # 속도 observation 스케일 (낮추면 속도를 과소평가)
+    VEL_SCALE = 0.3              # 속도 observation 스케일 (낮추면 속도를 과소평가)
+    ANG_VEL_SCALE = 0.5          # 각속도 observation 스케일 (낮추면 덜 반응)
 
     # --- 물리 파라미터 ---
     IRIS_MASS = 1.5              # Iris 드론 질량 (kg)
@@ -78,6 +79,10 @@ class RLDroneLandingController(Backend):
     # --- 토크 스케일 오버라이드 ---
     # None이면 mass_ratio로 자동 계산, 숫자면 직접 지정
     TORQUE_MULTIPLIER = 1.0      # 토크 전체 배율 (자동계산 후 추가 조정)
+
+    # --- 좌표계 조정 (드론이 치우치면 조정) ---
+    FLIP_X = False               # X축 반전 (앞뒤 반대면 True)
+    FLIP_Y = False               # Y축 반전 (좌우 반대면 True)
 
     # ============================================================
 
@@ -115,7 +120,10 @@ class RLDroneLandingController(Backend):
         print(f"  XY_GOAL_SCALE:   {self.XY_GOAL_SCALE}")
         print(f"  Z_GOAL_SCALE:    {self.Z_GOAL_SCALE}")
         print(f"  VEL_SCALE:       {self.VEL_SCALE}")
+        print(f"  ANG_VEL_SCALE:   {self.ANG_VEL_SCALE}")
         print(f"  TORQUE_MULTIPLIER: {self.TORQUE_MULTIPLIER}")
+        print(f"  FLIP_X:          {self.FLIP_X}")
+        print(f"  FLIP_Y:          {self.FLIP_Y}")
         print("="*60 + "\n")
         
         # 상태
@@ -138,16 +146,20 @@ class RLDroneLandingController(Backend):
         """Backend 필수 메서드"""
         self.dt = dt
         self.time += dt
-        
-        # 로버 이동
-        self.rover_pos += self.rover_vel * dt
-        
+
+        # NOTE: rover_pos는 App에서 업데이트하고, set_rover_pos()로 전달받음
+        # 여기서 다시 업데이트하면 sync 안 맞음!
+
         # 목표 위치 업데이트
         if self.estimated_rover_pos is not None:
             self.desired_pos_w[:2] = self.estimated_rover_pos[:2]
         else:
             self.desired_pos_w[:2] = self.rover_pos[:2]
         self.desired_pos_w[2] = self.landing_height
+
+    def set_rover_pos(self, pos):
+        """App에서 로버 위치를 직접 설정 (sync용)"""
+        self.rover_pos[:] = pos
     
     def input_reference(self):
         """RL 모델로 액션 결정 후 4개 로터 속도 반환"""
@@ -190,6 +202,8 @@ class RLDroneLandingController(Backend):
 
         # 2. 각속도 (드론 좌표계) - 3차원
         ang_vel_b = R.T @ ang_vel
+        # ★ 각속도 스케일 적용 (덜 반응하도록)
+        ang_vel_b = ang_vel_b * self.ANG_VEL_SCALE
 
         # 3. 중력 방향 (드론 좌표계) - 3차원
         gravity_w = np.array([0, 0, -1])
@@ -203,6 +217,12 @@ class RLDroneLandingController(Backend):
         desired_pos_b[0] = desired_pos_b[0] * self.XY_GOAL_SCALE  # X
         desired_pos_b[1] = desired_pos_b[1] * self.XY_GOAL_SCALE  # Y
         desired_pos_b[2] = desired_pos_b[2] * self.Z_GOAL_SCALE   # Z
+
+        # ★ 좌표축 반전 (드론이 엉뚱한 방향으로 가면 조정)
+        if self.FLIP_X:
+            desired_pos_b[0] = -desired_pos_b[0]
+        if self.FLIP_Y:
+            desired_pos_b[1] = -desired_pos_b[1]
 
         # 5. 상대 속도 (드론 좌표계) - 3차원
         rel_vel_world = lin_vel - self.rover_vel
@@ -362,8 +382,8 @@ class PegasusRLLandingApp:
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
         
         # 로버 설정
-        self.rover_pos = np.array([1.0, 0.0, 0.5])
-        self.rover_vel = np.array([0.1, 0.0, 0.0])
+        self.rover_pos = np.array([0.0, 3.0, 0.5])
+        self.rover_vel = np.array([0.0, 0.0, 0.0])
         
         # RL 제어기 생성
         self.controller = RLDroneLandingController(
@@ -383,7 +403,7 @@ class PegasusRLLandingApp:
         initial_pos = [
             self.rover_pos[0],  # 로버와 같은 X
             self.rover_pos[1],  # 로버와 같은 Y  
-            5.5                 # approach_height
+            3.5                 # approach_height
         ]
         
         print(f"[Init] Drone starting at: {initial_pos}")
@@ -774,19 +794,22 @@ class PegasusRLLandingApp:
         """로버 이동"""
         stage = omni.usd.get_context().get_stage()
         rover_prim = stage.GetPrimAtPath("/World/Rover")
-        
+
         if not rover_prim.IsValid():
             return
-        
+
         self.rover_pos += self.rover_vel * dt
-        
+
+        # Controller에도 로버 위치 동기화
+        self.controller.set_rover_pos(self.rover_pos)
+
         xformable = UsdGeom.Xformable(rover_prim)
         translate_op = None
         for op in xformable.GetOrderedXformOps():
             if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
                 translate_op = op
                 break
-        
+
         if translate_op:
             translate_op.Set(Gf.Vec3d(self.rover_pos[0], self.rover_pos[1], self.rover_pos[2]))
     
