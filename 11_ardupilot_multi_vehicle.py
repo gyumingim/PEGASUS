@@ -652,7 +652,7 @@ class PegasusRLLandingApp:
         xform = UsdGeom.Xformable(camera_prim)
         xform.ClearXformOpOrder()
         translate_op = xform.AddTranslateOp()
-        translate_op.Set(Gf.Vec3d(0, 0, -0.15))
+        translate_op.Set(Gf.Vec3d(0, 0, -0.11))
         
         if ARUCO_AVAILABLE:
             try:
@@ -733,7 +733,7 @@ class PegasusRLLandingApp:
                 aruco.drawDetectedMarkers(vis_img, corners, ids)
                 
                 # 3D 자세 추정
-                rvecs, tvecs = self._estimate_pose(corners, 0.6)
+                rvecs, tvecs = self._estimate_pose(corners, 0.768)
                 
                 if tvecs is not None and len(tvecs) > 0:
                     tvec = tvecs[0][0]
@@ -751,8 +751,8 @@ class PegasusRLLandingApp:
                     #   - 카메라 X축 → 드론 Y축 (오른쪽)
                     #   - 카메라 Y축 → 드론 X축 (앞쪽)
                     marker_in_body = np.array([
-                        tvec[1],    # body X = camera Y
-                        tvec[0],    # body Y = camera X
+                        -tvec[1]*1.3,    # body X = camera Y
+                        tvec[0]*1.3,    # body Y = camera X
                         -tvec[2]    # body Z = -camera Z (마커는 아래에 있으므로)
                     ])
 
