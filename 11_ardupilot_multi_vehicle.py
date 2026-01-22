@@ -56,7 +56,7 @@ class RLDroneLandingController(Backend):
     DEBUG_MODE = True           # True로 설정하면 매 스텝 상세 출력
 
     # --- ArUco 사용 여부 ---
-    USE_ARUCO = False           # False: ground truth 사용, True: ArUco 검출 사용
+    USE_ARUCO = True           # False: ground truth 사용, True: ArUco 검출 사용
 
     # --- 추력 관련 ---
     THRUST_SCALE = 1.0           # 전체 추력 스케일 (1.0 = 원본)
@@ -68,18 +68,13 @@ class RLDroneLandingController(Backend):
     YAW_SCALE = 1.0              # Yaw (회전) 감쇠 (1.0 = 원본)
 
     # --- XY 이동 감쇠 (observation 입력 스케일) ---
-    XY_GOAL_SCALE = 1.0          # XY 목표 거리 감쇠 (1.0 = 원본)
-    Z_GOAL_SCALE = 0.3           # Z 목표 거리 감쇠 (작을수록 하강 느림)
-
-    # --- 착륙 조건 ---
-    XY_THRESHOLD = 0.2           # XY 오차가 이 이하일 때만 하강 (m)
 
     # --- 속도 감쇠 (observation 입력 스케일) ---
     VEL_SCALE = 1.0              # 속도 observation 스케일 (1.0 = 원본)
     ANG_VEL_SCALE = 1.0          # 각속도 observation 스케일 (1.0 = 원본, 사용 안함)
 
     # --- 물리 파라미터 ---
-    IRIS_MASS = 1.5              # Iris 드론 질량 (kg)
+    IRIS_MASS = 500.0              # Iris 드론 질량 (kg)
     TRAIN_MASS = 0.033           # 학습 때 사용한 Crazyflie 질량 (kg)
     TRAIN_THRUST_TO_WEIGHT = 1.9 # 학습 때 thrust-to-weight ratio
     TRAIN_MOMENT_SCALE = 0.002   # 학습 때 moment scale (Nm)
@@ -120,9 +115,6 @@ class RLDroneLandingController(Backend):
         print(f"  ROLL_SCALE:      {self.ROLL_SCALE}")
         print(f"  PITCH_SCALE:     {self.PITCH_SCALE}")
         print(f"  YAW_SCALE:       {self.YAW_SCALE}")
-        print(f"  XY_GOAL_SCALE:   {self.XY_GOAL_SCALE}")
-        print(f"  Z_GOAL_SCALE:    {self.Z_GOAL_SCALE}")
-        print(f"  XY_THRESHOLD:    {self.XY_THRESHOLD}m (XY 정렬 후 하강)")
         print(f"  VEL_SCALE:       {self.VEL_SCALE}")
         print(f"  ANG_VEL_SCALE:   {self.ANG_VEL_SCALE}")
         print(f"  TORQUE_MULTIPLIER: {self.TORQUE_MULTIPLIER}")
@@ -140,54 +132,38 @@ class RLDroneLandingController(Backend):
         self._state = None
         
         # 착륙 상태
-        self.phase = "APPROACH"
-        self.approach_height = 5.5
         self.landing_height = 0.75
-        self.current_target_height = self.approach_height  # 현재 목표 높이
         
         # 목표 위치 (world frame)
-        self.desired_pos_w = np.array(rover_initial_pos, dtype=np.float32)
-        self.desired_pos_w[2] = self.landing_height
+        if self.USE_ARUCO:
+            self.desired_pos_w = None
+        else:
+            self.desired_pos_w = np.array(rover_initial_pos, dtype=np.float32)
+            self.desired_pos_w[2] = self.landing_height  # ← if 안쪽으로
         
         # 디버그 카운터
         self._obs_debug_count = 0
         self._action_debug_count = 0
-        
+
     def update(self, dt: float):
-        """Backend 필수 메서드"""
         self.dt = dt
         self.time += dt
-
-        # 목표 XY 위치 업데이트
-        if self.USE_ARUCO and self.estimated_rover_pos is not None:
-            # ArUco 검출 결과 사용
-            self.desired_pos_w[:2] = self.estimated_rover_pos[:2]
+        
+        # ★ 수정
+        if self.USE_ARUCO:
+            if self.estimated_rover_pos is not None:
+                if self.desired_pos_w is None:
+                    self.desired_pos_w = self.estimated_rover_pos.copy()
+                else:
+                    self.desired_pos_w[:2] = self.estimated_rover_pos[:2]
+                    self.desired_pos_w[2] = self.rover_pos[2]
+            # else: None 유지 (마지막 값 또는 None)
         else:
-            # Ground truth 사용 (디버깅용)
-            self.desired_pos_w[:2] = self.rover_pos[:2]
-
-        # ★★★ 조건부 하강: XY 정렬 후에만 하강 ★★★
-        if self._state is not None:
-            drone_pos = np.array(self._state.position)
-            xy_error = np.linalg.norm(drone_pos[:2] - self.desired_pos_w[:2])
-
-            if xy_error < self.XY_THRESHOLD:
-                # XY 정렬됨 → 하강
-                descent_rate = 0.5  # m/s
-                self.current_target_height = max(
-                    self.landing_height,
-                    self.current_target_height - descent_rate * dt
-                )
-                if self.phase != "LANDING":
-                    self.phase = "LANDING"
-                    print(f"[Phase] LANDING - XY error: {xy_error:.2f}m < {self.XY_THRESHOLD}m")
+            if self.desired_pos_w is None:
+                self.desired_pos_w = np.array(self.rover_pos, dtype=np.float32)
             else:
-                # XY 미정렬 → 높이 유지
-                if self.phase != "APPROACH":
-                    self.phase = "APPROACH"
-                    print(f"[Phase] APPROACH - XY error: {xy_error:.2f}m > {self.XY_THRESHOLD}m")
-
-        self.desired_pos_w[2] = self.current_target_height
+                self.desired_pos_w[:2] = self.rover_pos[:2]
+                self.desired_pos_w[2] = self.rover_pos[2]
 
     def set_rover_pos(self, pos):
         """App에서 로버 위치를 직접 설정 (sync용)"""
@@ -197,6 +173,15 @@ class RLDroneLandingController(Backend):
         """RL 모델로 액션 결정 후 4개 로터 속도 반환"""
         # 현재 상태 가져오기
         state = self._get_vehicle_state()
+
+        if self.USE_ARUCO and self.desired_pos_w is None:
+            hover_thrust = self.IRIS_MASS * self.gravity
+            if self.vehicle:
+                rotor_velocities = self.vehicle.force_and_torques_to_velocities(
+                    hover_thrust, np.array([0.0, 0.0, 0.0])
+                )
+                return rotor_velocities.tolist()
+            return [500.0, 500.0, 500.0, 500.0]
         
         # Observation 구성 (Isaac Lab과 동일한 16차원)
         obs = self._construct_observation(state)
@@ -248,13 +233,11 @@ class RLDroneLandingController(Backend):
         gravity_b = R.inv().apply(gravity_world)
 
         # ★★★ 4. 목표 위치 (body frame) ★★★
-        goal_rel_world = self.desired_pos_w - pos
-        desired_pos_b = R.inv().apply(goal_rel_world)
-
-        # XY/Z 스케일 적용 (필요시)
-        desired_pos_b[0] = desired_pos_b[0] * self.XY_GOAL_SCALE
-        desired_pos_b[1] = desired_pos_b[1] * self.XY_GOAL_SCALE
-        desired_pos_b[2] = desired_pos_b[2] * self.Z_GOAL_SCALE
+        if self.desired_pos_w is not None:
+            goal_rel_world = self.desired_pos_w - pos
+            desired_pos_b = R.inv().apply(goal_rel_world)
+        else:
+            desired_pos_b = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # hover
 
         # ★★★ 5. 상대 속도 (body frame) ★★★
         rel_vel_world = lin_vel - self.rover_vel
@@ -275,8 +258,15 @@ class RLDroneLandingController(Backend):
             print(f"{'='*70}")
             print(f"  Drone pos (world):    [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}]")
             print(f"  Rover pos (world):    [{self.rover_pos[0]:6.2f}, {self.rover_pos[1]:6.2f}, {self.rover_pos[2]:6.2f}]")
-            print(f"  Desired pos (world):  [{self.desired_pos_w[0]:6.2f}, {self.desired_pos_w[1]:6.2f}, {self.desired_pos_w[2]:6.2f}]")
-            print(f"  Goal rel (world):     [{goal_rel_world[0]:6.2f}, {goal_rel_world[1]:6.2f}, {goal_rel_world[2]:6.2f}] (norm: {np.linalg.norm(goal_rel_world):.2f}m)")
+            # ★ None 체크 추가
+            if self.desired_pos_w is not None:
+                goal_rel_world = self.desired_pos_w - pos
+                print(f"  Desired pos (world):  [{self.desired_pos_w[0]:6.2f}, {self.desired_pos_w[1]:6.2f}, {self.desired_pos_w[2]:6.2f}]")
+                print(f"  Goal rel (world):     [{goal_rel_world[0]:6.2f}, {goal_rel_world[1]:6.2f}, {goal_rel_world[2]:6.2f}] (norm: {np.linalg.norm(goal_rel_world):.2f}m)")
+            else:
+                print(f"  Desired pos (world):  None (waiting for ArUco)")
+                print(f"  Goal rel (world):     [0.00, 0.00, 0.00] (hovering)")
+            
             print(f"  Goal rel (body):      [{desired_pos_b[0]:6.2f}, {desired_pos_b[1]:6.2f}, {desired_pos_b[2]:6.2f}]")
             print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
             print(f"  Ang vel (world!):     [{ang_vel_obs[0]:6.2f}, {ang_vel_obs[1]:6.2f}, {ang_vel_obs[2]:6.2f}]")
@@ -378,12 +368,11 @@ class RLDroneLandingController(Backend):
     
     def stop(self):
         """Backend 중지"""
-        print(f"[RL Controller] Stopped - Final phase: {self.phase}")
+        print(f"[RL Controller] Stopped")
     
     def reset(self):
         """Backend 리셋"""
         self.time = 0.0
-        self.phase = "APPROACH"
         self.estimated_rover_pos = None
         self._obs_debug_count = 0
         self._action_debug_count = 0
@@ -439,9 +428,9 @@ class PegasusRLLandingApp:
         config.backends = [self.controller]
         
         initial_pos = [
-            -1.5,
-            -1.5,
-            5.5
+            -2.5,
+            -2.5,
+            3.5
         ]
         
         print(f"[Init] Drone starting at: {initial_pos}")
