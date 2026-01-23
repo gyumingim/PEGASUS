@@ -31,7 +31,7 @@ from pxr import Sdf, UsdShade, UsdGeom, Gf, UsdLux
 
 # MAVSDK
 from mavsdk import System
-from mavsdk.offboard import Attitude, OffboardError
+from mavsdk.offboard import AttitudeRate, OffboardError
 
 # Stable-Baselines3 (강화학습)
 try:
@@ -173,14 +173,14 @@ class RLDroneLandingController:
         """App에서 로버 위치를 직접 설정 (sync용)"""
         self.rover_pos[:] = pos
     
-    def get_attitude(self):
-        """RL 모델로 액션 결정 후 Attitude (roll, pitch, yaw, thrust) 반환"""
+    def get_attitude_rate(self):
+        """RL 모델로 액션 결정 후 AttitudeRate (roll_rate, pitch_rate, yaw_rate, thrust) 반환"""
         # 현재 상태 가져오기
         state = self._get_vehicle_state()
 
         if self.USE_ARUCO and self.desired_pos_w is None:
-            # 호버링: thrust 0.6, 수평 유지
-            return Attitude(0.0, 0.0, 0.0, 0.6)
+            # 호버링: thrust 0.6, 각속도 0
+            return AttitudeRate(0.0, 0.0, 0.0, 0.6)
 
         # Observation 구성 (Isaac Lab과 동일한 16차원)
         obs = self._construct_observation(state)
@@ -193,8 +193,8 @@ class RLDroneLandingController:
             action = action.cpu().numpy()
         action = action.flatten()
 
-        # 액션을 Attitude로 변환
-        return self._action_to_attitude(action, state)
+        # 액션을 AttitudeRate로 변환
+        return self._action_to_attitude_rate(action, state)
     
     def _construct_observation(self, state):
         """Isaac Lab 환경과 ★★★ 완전히 동일한 ★★★ 16차원 observation 구성
@@ -221,12 +221,13 @@ class RLDroneLandingController:
         lin_vel_b = R.inv().apply(lin_vel)
         lin_vel_b = lin_vel_b * self.VEL_SCALE
 
-        # ★★★ 2. 각속도 - IsaacLab에서는 world frame 그대로 사용! ★★★
-        # drone_landing_env.py: obs에 ang_vel 그대로 넣음 (변환 안함)
-        ang_vel_obs = ang_vel  # body frame 변환 안함!
+        # ★★★ 2. 각속도 (body frame) - IsaacLab과 동일하게! ★★★
+        # IsaacLab: root_ang_vel_b = body frame 사용
+        ang_vel_b = R.inv().apply(ang_vel)  # world → body frame 변환
 
-        # ★★★ 3. 중력 방향 (body frame) - 스케일 유지! ★★★
-        gravity_world = np.array([0, 0, -self.gravity], dtype=np.float32)
+        # ★★★ 3. 중력 방향 (body frame) - 정규화된 단위 벡터! ★★★
+        # IsaacLab: projected_gravity_b는 크기 1인 단위 벡터
+        gravity_world = np.array([0, 0, -1.0], dtype=np.float32)  # 정규화됨
         gravity_b = R.inv().apply(gravity_world)
 
         # ★★★ 4. 목표 위치 (body frame) ★★★
@@ -266,15 +267,15 @@ class RLDroneLandingController:
             
             print(f"  Goal rel (body):      [{desired_pos_b[0]:6.2f}, {desired_pos_b[1]:6.2f}, {desired_pos_b[2]:6.2f}]")
             print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
-            print(f"  Ang vel (world!):     [{ang_vel_obs[0]:6.2f}, {ang_vel_obs[1]:6.2f}, {ang_vel_obs[2]:6.2f}]")
+            print(f"  Ang vel (body):       [{ang_vel_b[0]:6.2f}, {ang_vel_b[1]:6.2f}, {ang_vel_b[2]:6.2f}]")
             print(f"  Gravity (body):       [{gravity_b[0]:6.2f}, {gravity_b[1]:6.2f}, {gravity_b[2]:6.2f}]")
             print(f"  Yaw: {np.degrees(current_yaw):6.1f}°")
         self._obs_debug_count += 1
 
         # ★★★ 16차원 연결 - IsaacLab과 완전히 동일한 순서! ★★★
         obs = np.concatenate([
-            lin_vel_b,        # 3: 선속도 (body) - R.inv().apply(vel)
-            ang_vel_obs,      # 3: 각속도 (world!) - 변환 안함!
+            lin_vel_b,        # 3: 선속도 (body)
+            ang_vel_b,        # 3: 각속도 (body) - IsaacLab: root_ang_vel_b
             gravity_b,        # 3: 중력 방향 (body)
             desired_pos_b,    # 3: 목표 위치 (body)
             rel_vel_b,        # 3: 상대 속도 (body)
@@ -283,8 +284,13 @@ class RLDroneLandingController:
 
         return obs.astype(np.float32)
     
-    def _action_to_attitude(self, action, state):
-        """RL 액션을 PX4 Attitude로 변환"""
+    def _action_to_attitude_rate(self, action, state):
+        """RL 액션을 PX4 AttitudeRate로 변환
+
+        IsaacLab에서 action[1:4]는 토크(moment)를 의미함.
+        PX4 AttitudeRate는 각속도(deg/s)를 받으므로,
+        토크를 각속도로 스케일링하여 전달.
+        """
         # 액션 클리핑
         action = np.clip(action, -1.0, 1.0)
 
@@ -297,26 +303,28 @@ class RLDroneLandingController:
         pitch_action = action[2]
         yaw_action = action[3]
 
-        # PX4 Attitude로 변환
+        # PX4 AttitudeRate로 변환
         # thrust: -1~1 → 0~1
         thrust = (thrust_action + 1.0) / 2.0 * self.THRUST_SCALE + self.THRUST_OFFSET
         thrust = np.clip(thrust, 0.0, 1.0)
 
-        # roll, pitch, yaw: -1~1 → degree (최대 ±30도)
-        max_angle = 30.0
-        roll_deg = roll_action * self.ROLL_SCALE * max_angle
-        pitch_deg = pitch_action * self.PITCH_SCALE * max_angle
-        yaw_deg = yaw_action * self.YAW_SCALE * max_angle
+        # roll, pitch, yaw: -1~1 → deg/s (각속도)
+        # IsaacLab moment_scale=0.002 N·m를 각속도로 변환
+        # 튜닝 필요: rate_scale은 드론 관성모멘트에 따라 조정
+        rate_scale = 180.0  # 최대 ±180 deg/s
+        roll_rate = roll_action * self.ROLL_SCALE * rate_scale
+        pitch_rate = pitch_action * self.PITCH_SCALE * rate_scale
+        yaw_rate = yaw_action * self.YAW_SCALE * rate_scale
 
         if (self.DEBUG_MODE or self._action_debug_count < 5) and self._action_debug_count % 50 == 1:
             print(f"\n{'='*70}")
             print(f"🎮 Action Debug (step {self._action_debug_count})")
             print(f"{'='*70}")
             print(f"  Raw action (RL):  [{original_action[0]:6.3f}, {original_action[1]:6.3f}, {original_action[2]:6.3f}, {original_action[3]:6.3f}]")
-            print(f"  Attitude:         roll={roll_deg:6.1f}°, pitch={pitch_deg:6.1f}°, yaw={yaw_deg:6.1f}°, thrust={thrust:.2f}")
+            print(f"  AttitudeRate:     roll={roll_rate:6.1f}°/s, pitch={pitch_rate:6.1f}°/s, yaw={yaw_rate:6.1f}°/s, thrust={thrust:.2f}")
         self._action_debug_count += 1
 
-        return Attitude(roll_deg, pitch_deg, yaw_deg, thrust)
+        return AttitudeRate(roll_rate, pitch_rate, yaw_rate, thrust)
     
     def update_estimator(self, marker_pos_world):
         """태그 감지 결과 업데이트"""
@@ -871,7 +879,7 @@ class PegasusRLLandingApp:
         await drone.action.arm()
 
         print("[MAVSDK] -- 초기 setpoint 설정")
-        await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.0))
+        await drone.offboard.set_attitude_rate(AttitudeRate(0.0, 0.0, 0.0, 0.0))
 
         print("[MAVSDK] -- Offboard 모드 시작")
         try:
@@ -891,11 +899,11 @@ class PegasusRLLandingApp:
             self.controller.update_state(drone_state)
             self.controller.update(0.02)
 
-            # RL 모델에서 attitude 가져오기
-            attitude = self.controller.get_attitude()
+            # RL 모델에서 attitude rate 가져오기
+            attitude_rate = self.controller.get_attitude_rate()
 
             # PX4로 전송
-            await drone.offboard.set_attitude(attitude)
+            await drone.offboard.set_attitude_rate(attitude_rate)
 
             await asyncio.sleep(0.02)  # 50Hz
 
@@ -908,6 +916,9 @@ class PegasusRLLandingApp:
         print("[MAVSDK] -- 착륙")
         await drone.action.land()
         await asyncio.sleep(3)
+
+        # MAVSDK 연결 종료
+        print("[MAVSDK] -- 연결 종료")
 
     def run_control_thread(self):
         """별도 스레드에서 asyncio 이벤트 루프를 실행하여 드론 제어"""
@@ -973,21 +984,45 @@ class PegasusRLLandingApp:
         print(f"  감지율: {self.detection_count / max(1, self.step_count/2) * 100:.1f}%")
         print(f"  디버그 이미지: /tmp/aruco_rl_*.png")
         print(f"{'='*70}\n")
-        
+
         carb.log_warn("Simulation closing")
+
+        # ★★★ PX4 프로세스 정리 (중요!) ★★★
+        # Backend의 stop()을 호출해야 PX4 프로세스가 kill됨
+        try:
+            for backend in self.drone._backends:
+                if hasattr(backend, 'stop'):
+                    print("[Cleanup] Stopping backend...")
+                    backend.stop()
+        except Exception as e:
+            print(f"[Cleanup] Backend stop error: {e}")
+
         self.timeline.stop()
         simulation_app.close()
 
 
 def main():
     import sys
-    
+    import signal
+
+    app = None
+
+    def cleanup_handler(signum, frame):
+        """Ctrl+C 등 시그널 처리"""
+        print("\n[Signal] 종료 신호 수신, 정리 중...")
+        if app is not None:
+            app.stop_sim = True
+
+    # 시그널 핸들러 등록
+    signal.signal(signal.SIGINT, cleanup_handler)
+    signal.signal(signal.SIGTERM, cleanup_handler)
+
     # 모델 경로 설정
     if len(sys.argv) > 1:
         model_path = sys.argv[1]
     else:
         model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-20_15-52-16/model.zip"
-    
+
     print(f"\n{'='*70}")
     print(f"RL 드론 착륙 시뮬레이션")
     print(f"{'='*70}")
@@ -1001,15 +1036,28 @@ def main():
         print(f"   - 실제 로버 위치를 목표로 사용")
         print(f"   - Observation이 올바른지 테스트용")
     print(f"{'='*70}\n")
-    
+
     # RL 모델 사용 가능 확인
     if not RL_AVAILABLE:
         print("[ERROR] stable-baselines3 not installed!")
         print("Install: pip install stable-baselines3")
         return
-    
-    app = PegasusRLLandingApp(model_path)
-    app.run()
+
+    try:
+        app = PegasusRLLandingApp(model_path)
+        app.run()
+    except Exception as e:
+        print(f"[ERROR] 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # 최종 정리: 남은 PX4 프로세스 강제 종료
+        import subprocess
+        try:
+            subprocess.run(["pkill", "-f", "px4"], capture_output=True, timeout=5)
+            print("[Cleanup] PX4 프로세스 정리 완료")
+        except:
+            pass
 
 
 if __name__ == "__main__":
