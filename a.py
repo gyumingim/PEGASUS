@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """
-통합 PX4 시뮬레이션 및 제어 스크립트
-Isaac Sim으로 시뮬레이션을 실행하고 MAVSDK로 드론을 제어합니다.
+Pegasus 드론 착륙 시뮬레이션 (강화학습 모델 사용) - 변환 레이어 적용 버전
+
+핵심 변경사항:
+- Isaac Lab (토크 제어) → PX4 (Attitude 제어) 변환 레이어 추가
+- Action 인덱스 수정: [0]=thrust, [1]=roll, [2]=pitch, [3]=yaw
+- 토크 → 각도 변환 로직 구현
 """
 
-import asyncio
-import threading
 import carb
 from isaacsim import SimulationApp
 
@@ -13,161 +15,1081 @@ from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
 
 import omni.timeline
+import omni
 from omni.isaac.core.world import World
+import torch
+import numpy as np
+from scipy.spatial.transform import Rotation
+import asyncio
+import threading
+
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
-from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
-from scipy.spatial.transform import Rotation
+from pegasus.simulator.logic.backends.px4_mavlink_backend import PX4MavlinkBackend, PX4MavlinkBackendConfig
 
-# MAVSDK 임포트
+from pxr import Sdf, UsdShade, UsdGeom, Gf, UsdLux
+
+# MAVSDK
 from mavsdk import System
-from mavsdk.offboard import Attitude, OffboardError
+from mavsdk.offboard import AttitudeRate, OffboardError, Attitude
+
+# Stable-Baselines3 (강화학습)
+try:
+    from stable_baselines3 import PPO
+    RL_AVAILABLE = True
+except ImportError:
+    RL_AVAILABLE = False
+    print("[WARN] stable-baselines3 not available. Install: pip install stable-baselines3")
+
+# OpenCV (ArUco 감지)
+try:
+    import cv2
+    import cv2.aruco as aruco
+    ARUCO_AVAILABLE = True
+except ImportError:
+    ARUCO_AVAILABLE = False
+    print("[WARN] OpenCV not available")
 
 
-class PegasusApp:
+class IsaacLabToPX4Converter:
     """
-    Isaac Sim 시뮬레이션과 MAVSDK 제어를 통합한 클래스
+    Isaac Lab 토크 명령 → PX4 Attitude 명령 변환 레이어
+
+    Isaac Lab 학습 환경:
+    - action[0]: thrust 비율 [-1, 1] → [0, 1.9] × 무게
+    - action[1]: roll 토크 [-1, 1] → [-0.002, +0.002] N·m
+    - action[2]: pitch 토크 [-1, 1] → [-0.002, +0.002] N·m
+    - action[3]: yaw 토크 [-1, 1] → [-0.002, +0.002] N·m
+
+    PX4 Attitude 명령:
+    - roll: 목표 각도 (degrees)
+    - pitch: 목표 각도 (degrees)
+    - yaw: 목표 각도 (degrees)
+    - thrust: 정규화된 추력 [0, 1]
     """
 
     def __init__(self):
-        """시뮬레이션 환경 초기화"""
-        
+        # ========== Isaac Lab 학습 파라미터 ==========
+        self.TRAIN_MASS = 0.033  # Crazyflie 질량 (kg)
+        self.TRAIN_THRUST_TO_WEIGHT = 1.9  # 학습 시 thrust-to-weight
+        self.TRAIN_MOMENT_SCALE = 0.002  # 학습 시 moment scale (N·m)
+        self.TRAIN_GRAVITY = 9.81
+
+        # Crazyflie 관성모멘트 (kg·m²)
+        self.TRAIN_Ixx = 1.4e-5
+        self.TRAIN_Iyy = 1.4e-5
+        self.TRAIN_Izz = 2.17e-5
+
+        # ========== Iris (Pegasus) 물리 파라미터 ==========
+        self.IRIS_MASS = 1.5  # Iris 질량 (kg)
+        self.IRIS_GRAVITY = 9.81
+
+        # Iris 관성모멘트 (kg·m²) - 대략적 추정값
+        self.IRIS_Ixx = 0.029
+        self.IRIS_Iyy = 0.029
+        self.IRIS_Izz = 0.055
+
+        # ========== 변환 비율 계산 ==========
+        # 관성모멘트 비율: Iris가 ~2000배 더 큼
+        self.INERTIA_RATIO_ROLL = self.IRIS_Ixx / self.TRAIN_Ixx
+        self.INERTIA_RATIO_PITCH = self.IRIS_Iyy / self.TRAIN_Iyy
+        self.INERTIA_RATIO_YAW = self.IRIS_Izz / self.TRAIN_Izz
+
+        # 질량 비율
+        self.MASS_RATIO = self.IRIS_MASS / self.TRAIN_MASS
+
+        # ========== 튜닝 파라미터 ==========
+        # 토크 → 각도 변환 게인 (실험적으로 조정 필요)
+        # 기본 공식: angle = k * torque / I * dt^2 / 2
+        # 단순화: angle = TORQUE_TO_ANGLE_GAIN * normalized_torque
+
+        self.TORQUE_TO_ANGLE_GAIN_ROLL = 7.0   # degrees per normalized action
+        self.TORQUE_TO_ANGLE_GAIN_PITCH = 7.0  # degrees per normalized action
+        self.TORQUE_TO_ANGLE_GAIN_YAW = 15.0    # degrees per normalized action (yaw는 더 크게)
+
+        # 최대 각도 제한
+        self.MAX_ROLL = 35.0   # degrees
+        self.MAX_PITCH = 35.0  # degrees
+
+        # ========== 상태 변수 (적분용) ==========
+        self.integrated_yaw = 0.0
+
+        # 이전 값 (필터링용)
+        self.prev_action = np.zeros(4)
+
+        # 시뮬레이션 dt
+        self.dt = 0.02  # 50Hz
+
+        # 디버그
+        self.debug_count = 0
+
+        print("\n" + "="*70)
+        print("Isaac Lab -> PX4 변환 레이어 초기화")
+        print("="*70)
+        print(f"  학습 환경 (Crazyflie):")
+        print(f"    Mass: {self.TRAIN_MASS} kg")
+        print(f"    Ixx/Iyy: {self.TRAIN_Ixx} kg*m^2")
+        print(f"    Moment scale: {self.TRAIN_MOMENT_SCALE} N*m")
+        print(f"  실행 환경 (Iris):")
+        print(f"    Mass: {self.IRIS_MASS} kg")
+        print(f"    Ixx/Iyy: {self.IRIS_Ixx} kg*m^2")
+        print(f"  변환 비율:")
+        print(f"    Mass ratio: {self.MASS_RATIO:.1f}x")
+        print(f"    Inertia ratio (roll/pitch): {self.INERTIA_RATIO_ROLL:.1f}x")
+        print(f"  튜닝 게인:")
+        print(f"    Roll/Pitch angle gain: {self.TORQUE_TO_ANGLE_GAIN_ROLL} deg")
+        print(f"    Yaw angle gain: {self.TORQUE_TO_ANGLE_GAIN_YAW} deg")
+        print("="*70 + "\n")
+
+    def convert(self, isaac_action: np.ndarray, current_attitude: np.ndarray,
+                current_angular_vel: np.ndarray) -> Attitude:
+        """
+        Isaac Lab 액션을 PX4 Attitude 명령으로 변환
+
+        Args:
+            isaac_action: [thrust, roll_torque, pitch_torque, yaw_torque] 범위 [-1, 1]
+            current_attitude: 현재 오일러 각도 [roll, pitch, yaw] (degrees)
+            current_angular_vel: 현재 각속도 [p, q, r] (rad/s)
+
+        Returns:
+            Attitude(roll_deg, pitch_deg, yaw_deg, thrust)
+        """
+
+        # ========== 1. 액션 필터링 (노이즈 제거) ==========
+        alpha = 0.4  # 필터 계수 (0.3~0.5 권장)
+        filtered_action = alpha * isaac_action + (1 - alpha) * self.prev_action
+        self.prev_action = filtered_action.copy()
+
+        # 클리핑
+        filtered_action = np.clip(filtered_action, -1.0, 1.0)
+
+        # ========== 2. 액션 분리 (올바른 인덱스!) ==========
+        thrust_action = filtered_action[0]   # 추력
+        roll_action = filtered_action[1]     # roll 토크 (인덱스 1!)
+        pitch_action = filtered_action[2]    # pitch 토크 (인덱스 2!)
+        yaw_action = filtered_action[3]      # yaw 토크
+
+        # ========== 3. 추력 변환 ==========
+        # Isaac Lab: thrust_ratio = 1.9 * (action + 1) / 2
+        # action = 0 → ratio = 0.95 (거의 호버링)
+        # action = 0.053 → ratio ≈ 1.0 (정확한 호버링)
+
+        # Isaac Lab 추력 비율 계산
+        isaac_thrust_ratio = self.TRAIN_THRUST_TO_WEIGHT * (thrust_action + 1.0) / 2.0
+
+        # PX4 추력으로 변환 (호버링 = 0.5 기준)
+        # isaac_ratio 1.0 → px4 0.5
+        # isaac_ratio 1.9 → px4 ~0.95
+        # isaac_ratio 0.0 → px4 0.0
+        px4_thrust = isaac_thrust_ratio / self.TRAIN_THRUST_TO_WEIGHT
+        px4_thrust = np.clip(px4_thrust, 0.0, 1.0)
+
+        # ========== 4. 토크 → 목표 각도 변환 ==========
+        # 방법 1: 직접 매핑 (토크 크기를 목표 각도로 해석)
+        # 토크가 클수록 더 큰 각도를 목표로 함
+
+        # 정규화된 토크 [-1, 1]을 각도로 변환
+        target_roll = roll_action * self.TORQUE_TO_ANGLE_GAIN_ROLL
+        target_pitch = pitch_action * self.TORQUE_TO_ANGLE_GAIN_PITCH
+
+        # ========== 5. Yaw 처리 (적분 방식) ==========
+        # Yaw는 절대 각도가 아닌 변화율로 해석
+        yaw_rate = yaw_action * self.TORQUE_TO_ANGLE_GAIN_YAW  # deg/s
+        self.integrated_yaw += yaw_rate * self.dt
+
+        # Yaw 정규화 [-180, 180]
+        self.integrated_yaw = (self.integrated_yaw + 180) % 360 - 180
+
+        # ========== 6. 각도 제한 ==========
+        target_roll = np.clip(target_roll, -self.MAX_ROLL, self.MAX_ROLL)
+        target_pitch = np.clip(target_pitch, -self.MAX_PITCH, self.MAX_PITCH)
+
+        # ========== 7. 부호 조정 (좌표계 맞춤) ==========
+        # Isaac Lab과 PX4의 좌표계 차이 보정
+        final_roll = target_roll  # 부호 조정 (실험적으로 확인 필요)
+        final_pitch = -target_pitch
+        final_yaw = self.integrated_yaw
+
+        # ========== 8. 디버깅 ==========
+        if self.debug_count % 50 == 0:
+            print(f"\n{'='*70}")
+            print(f"Converter Debug (step {self.debug_count})")
+            print(f"{'='*70}")
+            print(f"  Isaac action: [{thrust_action:+.3f}, {roll_action:+.3f}, "
+                  f"{pitch_action:+.3f}, {yaw_action:+.3f}]")
+            print(f"  Isaac thrust ratio: {isaac_thrust_ratio:.3f} (hover=1.0)")
+            print(f"  PX4 thrust: {px4_thrust:.3f} (hover=0.5)")
+            print(f"  Target angle: roll={target_roll:+.1f} deg, pitch={target_pitch:+.1f} deg")
+            print(f"  Final cmd: roll={final_roll:+.1f} deg, pitch={final_pitch:+.1f} deg, "
+                  f"yaw={final_yaw:+.1f} deg, thrust={px4_thrust:.3f}")
+            print(f"  Current attitude: roll={current_attitude[0]:+.1f} deg, "
+                  f"pitch={current_attitude[1]:+.1f} deg, yaw={current_attitude[2]:+.1f} deg")
+        self.debug_count += 1
+
+        return Attitude(
+            float(final_roll),
+            float(final_pitch),
+            float(final_yaw),
+            float(px4_thrust)
+        )
+
+    def reset(self):
+        """상태 초기화"""
+        self.integrated_yaw = 0.0
+        self.prev_action = np.zeros(4)
+        self.debug_count = 0
+        print("[Converter] Reset")
+
+
+class RLDroneLandingController:
+    """강화학습 기반 드론 착륙 제어기 (PX4 Offboard용) - 변환 레이어 적용"""
+
+    # ============================================================
+    # 튜닝 파라미터
+    # ============================================================
+
+    DEBUG_MODE = True
+    USE_ARUCO = False  # Ground truth 사용
+
+    # Observation 스케일
+    VEL_SCALE = 1.0
+    ANG_VEL_SCALE = 1.0
+
+    # 목표 위치 오프셋 (튜닝용)
+    TARGET_X_OFFSET = 0.9  # X 방향 오프셋 (m)
+    TARGET_Y_OFFSET = -0.4   # Y 방향 오프셋 (m)
+
+    # ============================================================
+
+    def __init__(self, rover_initial_pos, rover_velocity, model_path, device="cuda", detection_callback=None):
+        self.rl_device = device
+        self.vehicle = None
+
+        # 디버그 카운터
+        self._obs_debug_count = 0
+        self._action_debug_count = 0
+
+        # 변환 레이어 초기화
+        self.converter = IsaacLabToPX4Converter()
+
+        # 로버 설정
+        self.rover_pos = np.array(rover_initial_pos, dtype=np.float32)
+        self.rover_vel = np.array(rover_velocity, dtype=np.float32)
+
+        # RL 모델 로드
+        if RL_AVAILABLE:
+            print(f"[RL] Loading model from: {model_path}")
+            self.model = PPO.load(model_path, device=device)
+            print(f"[RL] Model loaded successfully on {device}")
+        else:
+            raise ImportError("stable-baselines3 not installed!")
+
+        # 물리 파라미터
+        self.gravity = 9.81
+
+        # 상태
+        self.dt = 0.02
+        self.time = 0.0
+        self.estimated_rover_pos = None
+        self.detection_callback = detection_callback
+        self._state = None
+
+        # 착륙 상태
+        self.landing_height = 0.75
+
+        self.takeoff_mode = False
+        self.takeoff_target_pos = None
+
+        # 목표 위치 (world frame)
+        if self.USE_ARUCO:
+            self.desired_pos_w = None
+        else:
+            self.desired_pos_w = np.array(rover_initial_pos, dtype=np.float32)
+            self.desired_pos_w[2] = self.landing_height
+
+        print("\n" + "="*60)
+        print("RL Controller 초기화 완료")
+        print("="*60)
+        print(f"  DEBUG_MODE: {self.DEBUG_MODE}")
+        print(f"  USE_ARUCO:  {self.USE_ARUCO}")
+        print(f"  변환 레이어: IsaacLabToPX4Converter 사용")
+        print("="*60 + "\n")
+
+    def update(self, dt: float):
+        self.dt = dt
+        self.time += dt
+        self.converter.dt = dt  # 변환 레이어에도 dt 전달
+
+        if self.USE_ARUCO:
+            if self.estimated_rover_pos is not None:
+                if self.desired_pos_w is None:
+                    self.desired_pos_w = self.estimated_rover_pos.copy()
+                else:
+                    self.desired_pos_w[:2] = self.estimated_rover_pos[:2]
+                    self.desired_pos_w[2] = self.rover_pos[2]
+        else:
+            if self.desired_pos_w is None:
+                self.desired_pos_w = np.array(self.rover_pos, dtype=np.float32)
+            else:
+                self.desired_pos_w[:2] = self.rover_pos[:2]
+                self.desired_pos_w[2] = self.rover_pos[2]
+
+        # XY 오프셋 적용 (목표 위치 보정)
+        if self.desired_pos_w is not None:
+            self.desired_pos_w[0] += self.TARGET_X_OFFSET
+            self.desired_pos_w[1] += self.TARGET_Y_OFFSET
+
+            
+
+    def set_rover_pos(self, pos):
+        """App에서 로버 위치를 직접 설정 (sync용)"""
+        self.rover_pos[:] = pos
+
+    def get_attitude_rate(self):
+        """RL 모델로 액션 결정 후 Attitude 반환"""
+        state = self._get_vehicle_state()
+
+        # Takeoff 모드
+        if self.takeoff_mode:
+            if self.takeoff_target_pos is not None:
+                current_height = np.array(self._state.position)[2]
+                target_height = self.takeoff_target_pos[2]
+
+                if current_height >= target_height - 0.2:
+                    print(f"[Takeoff] 목표 높이 도달!")
+                    self.takeoff_mode = False
+                    return Attitude(0.0, 0.0, 0.0, 0.55)
+
+                if self._action_debug_count % 50 == 0:
+                    print(f"[Takeoff] 상승 중... {current_height:.2f}m / {target_height:.2f}m")
+
+                self._action_debug_count += 1
+                return Attitude(0.0, 0.0, 0.0, 0.7)
+            else:
+                return Attitude(0.0, 0.0, 0.0, 0.6)
+
+        if self.USE_ARUCO and self.desired_pos_w is None:
+            return Attitude(0.0, 0.0, 0.0, 0.6)
+
+        # Observation 구성
+        obs = self._construct_observation(state)
+
+        # RL 모델로 액션 예측
+        action, _states = self.model.predict(obs, deterministic=True)
+
+        if isinstance(action, torch.Tensor):
+            action = action.cpu().numpy()
+        action = action.flatten()
+
+        # 변환 레이어를 통해 PX4 명령으로 변환
+        current_attitude = self._get_euler_from_state(state)
+        current_angular_vel = np.array(state.angular_velocity, dtype=np.float32)
+
+        attitude_cmd = self.converter.convert(action, current_attitude, current_angular_vel)
+
+        self._action_debug_count += 1
+        return attitude_cmd
+
+    def _get_euler_from_state(self, state):
+        """상태에서 오일러 각도 추출 (degrees)"""
+        quat_xyzw = np.array(state.attitude, dtype=np.float32)
+        r = Rotation.from_quat(quat_xyzw)
+        euler = r.as_euler('XYZ', degrees=True)
+        return euler  # [roll, pitch, yaw]
+
+    def _construct_observation(self, state):
+        """Isaac Lab 환경과 동일한 16차원 observation 구성"""
+
+        pos = np.array(state.position, dtype=np.float32)
+        lin_vel = np.array(state.linear_velocity, dtype=np.float32)
+        ang_vel = np.array(state.angular_velocity, dtype=np.float32)
+
+        quat_xyzw = np.array(state.attitude, dtype=np.float32)
+        R = Rotation.from_quat(quat_xyzw)
+
+        # 1. 드론 속도 (body frame)
+        lin_vel_b = R.inv().apply(lin_vel)
+        lin_vel_b = lin_vel_b * self.VEL_SCALE
+
+        # 2. 각속도 (body frame)
+        ang_vel_b = R.inv().apply(ang_vel)
+
+        # 3. 중력 방향 (body frame)
+        gravity_world = np.array([0, 0, -1.0], dtype=np.float32)
+        gravity_b = R.inv().apply(gravity_world)
+
+        # 4. 목표 위치 (body frame)
+        if self.desired_pos_w is not None:
+            goal_rel_world = self.desired_pos_w - pos
+            desired_pos_b = R.inv().apply(goal_rel_world)
+        else:
+            desired_pos_b = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        # 5. 상대 속도 (body frame)
+        rel_vel_world = lin_vel - self.rover_vel
+        rel_vel_b = R.inv().apply(rel_vel_world)
+        rel_vel_b = rel_vel_b * self.VEL_SCALE
+
+        # 6. Yaw 각도
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        current_yaw = np.arctan2(
+            2.0 * (quat_wxyz[0]*quat_wxyz[3] + quat_wxyz[1]*quat_wxyz[2]),
+            1.0 - 2.0 * (quat_wxyz[2]**2 + quat_wxyz[3]**2)
+        )
+
+        # 디버깅 출력
+        if (self.DEBUG_MODE or self._obs_debug_count < 5) and self._obs_debug_count % 50 == 1:
+            print(f"\n{'='*70}")
+            print(f"Observation Debug (step {self._obs_debug_count})")
+            print(f"{'='*70}")
+            print(f"  Drone pos (world):    [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}]")
+            print(f"  Rover pos (world):    [{self.rover_pos[0]:6.2f}, {self.rover_pos[1]:6.2f}, {self.rover_pos[2]:6.2f}]")
+            if self.desired_pos_w is not None:
+                goal_rel_world = self.desired_pos_w - pos
+                print(f"  Desired pos (world):  [{self.desired_pos_w[0]:6.2f}, {self.desired_pos_w[1]:6.2f}, {self.desired_pos_w[2]:6.2f}]")
+                print(f"  Goal rel (world):     [{goal_rel_world[0]:6.2f}, {goal_rel_world[1]:6.2f}, {goal_rel_world[2]:6.2f}] (norm: {np.linalg.norm(goal_rel_world):.2f}m)")
+            else:
+                print(f"  Desired pos (world):  None (waiting for ArUco)")
+
+            print(f"  Goal rel (body):      [{desired_pos_b[0]:6.2f}, {desired_pos_b[1]:6.2f}, {desired_pos_b[2]:6.2f}]")
+            print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
+            print(f"  Ang vel (body):       [{ang_vel_b[0]:6.2f}, {ang_vel_b[1]:6.2f}, {ang_vel_b[2]:6.2f}]")
+            print(f"  Gravity (body):       [{gravity_b[0]:6.2f}, {gravity_b[1]:6.2f}, {gravity_b[2]:6.2f}]")
+            print(f"  Yaw: {np.degrees(current_yaw):6.1f} deg")
+        self._obs_debug_count += 1
+
+        # 16차원 observation
+        obs = np.concatenate([
+            lin_vel_b,        # 3
+            ang_vel_b,        # 3
+            gravity_b,        # 3
+            desired_pos_b,    # 3
+            rel_vel_b,        # 3
+            [current_yaw]     # 1
+        ])
+
+        return obs.astype(np.float32)
+
+    def update_estimator(self, marker_pos_world):
+        """태그 감지 결과 업데이트"""
+        self.estimated_rover_pos = marker_pos_world
+
+    def update_sensor(self, sensor_type: str, sensor_data: dict):
+        pass
+
+    def update_state(self, state: dict):
+        self._state = state
+
+    def start(self):
+        print("[RL Controller] Started")
+
+    def stop(self):
+        print(f"[RL Controller] Stopped")
+
+    def reset(self):
+        self.time = 0.0
+        self.estimated_rover_pos = None
+        self._obs_debug_count = 0
+        self._action_debug_count = 0
+        self.converter.reset()
+        print("[RL Controller] Reset")
+
+    def update_graphical_sensor(self, sensor_data: dict):
+        pass
+
+    def _get_vehicle_state(self):
+        if hasattr(self, '_state') and self._state is not None:
+            return self._state
+
+        class DummyState:
+            def __init__(self):
+                self.position = np.zeros(3, dtype=np.float32)
+                self.linear_velocity = np.zeros(3, dtype=np.float32)
+                self.attitude = np.array([0, 0, 0, 1], dtype=np.float32)
+                self.angular_velocity = np.zeros(3, dtype=np.float32)
+
+        return DummyState()
+
+    def set_takeoff_target(self, target_pos):
+        self.takeoff_mode = True
+        self.takeoff_target_pos = np.array(target_pos, dtype=np.float32)
+        print(f"[Takeoff] 목표 설정: {target_pos}")
+
+
+class PegasusRLLandingApp:
+    """Pegasus RL 착륙 시뮬레이션 앱"""
+
+    def __init__(self, model_path):
         self.timeline = omni.timeline.get_timeline_interface()
         self.pg = PegasusInterface()
         self.pg._world = World(**self.pg._world_settings)
         self.world = self.pg.world
+        self.last_detection_time = 0.0
 
-        # 환경 로드
+        self.flight_phase = "TAKEOFF"
+        self.takeoff_target_height = 2.0
+        self.takeoff_complete = False
+
         self.pg.load_environment(SIMULATION_ENVIRONMENTS["Curved Gridroom"])
 
+        # 로버 설정
+        self.rover_pos = np.array([0.0, 0.0, -0.4], dtype=np.float32)
+        self.rover_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        # RL 제어기 생성
+        self.controller = RLDroneLandingController(
+            self.rover_pos.copy(),
+            self.rover_vel.copy(),
+            model_path=model_path,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            detection_callback=self._on_detection
+        )
+
         # 드론 생성
-        config_multirotor = MultirotorConfig()
+        config = MultirotorConfig()
         mavlink_config = PX4MavlinkBackendConfig({
             "vehicle_id": 0,
             "px4_autolaunch": True,
             "px4_dir": self.pg.px4_path,
             "px4_vehicle_model": self.pg.px4_default_airframe
         })
-        config_multirotor.backends = [PX4MavlinkBackend(mavlink_config)]
+        config.backends = [PX4MavlinkBackend(mavlink_config)]
 
-        Multirotor(
-            "/World/quadrotor",
+        initial_pos = [-2.5, -2.5, 0.5]
+
+        print(f"[Init] Drone starting at: {initial_pos}")
+        print(f"[Init] Rover at: {self.rover_pos}")
+
+        self.drone = Multirotor(
+            "/World/Drone",
             ROBOTS['Iris'],
             0,
-            [0.0, 0.0, 0.07],
-            Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
-            config=config_multirotor,
+            initial_pos,
+            Rotation.from_euler("XYZ", [0, 0, 0], degrees=True).as_quat(),
+            config=config
         )
 
-        self.world.reset()
         self.stop_sim = False
-        self.control_started = False
+
+        self._add_lighting()
+        self._create_rover()
+        self._setup_camera()
+
+        if ARUCO_AVAILABLE:
+            self._init_aruco()
+
+        self.world.reset()
+
+        self.step_count = 0
+        self.detection_count = 0
+        self.last_saved_frame = -1
+        self.last_detection_time = 0.0
+
+    def _add_lighting(self):
+        stage = omni.usd.get_context().get_stage()
+
+        distant_light_path = "/World/DistantLight"
+        distant_light = UsdLux.DistantLight.Define(stage, distant_light_path)
+        distant_light.CreateIntensityAttr(5000.0)
+        distant_light.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 0.95))
+        distant_light.CreateAngleAttr(0.53)
+
+        xform = UsdGeom.Xformable(distant_light)
+        xform.ClearXformOpOrder()
+        rotate_op = xform.AddRotateXYZOp()
+        rotate_op.Set(Gf.Vec3f(-45, 45, 0))
+
+        dome_light_path = "/World/DomeLight"
+        dome_light = UsdLux.DomeLight.Define(stage, dome_light_path)
+        dome_light.CreateIntensityAttr(1000.0)
+        dome_light.CreateColorAttr(Gf.Vec3f(0.9, 0.95, 1.0))
+
+        print("[Lighting] Added: DistantLight + DomeLight")
+
+    def _create_rover(self):
+        stage = omni.usd.get_context().get_stage()
+        from pxr import UsdGeom, UsdPhysics
+
+        rover_path = "/World/Rover"
+        xform = UsdGeom.Xform.Define(stage, rover_path)
+
+        cube_path = rover_path + "/Cube"
+        cube = UsdGeom.Cube.Define(stage, cube_path)
+        cube.GetSizeAttr().Set(1)
+
+        cube_mtl_path = Sdf.Path(cube_path + "_Material")
+        cube_mtl = UsdShade.Material.Define(stage, cube_mtl_path)
+        cube_shader = UsdShade.Shader.Define(stage, cube_mtl_path.AppendPath("Shader"))
+        cube_shader.CreateIdAttr("UsdPreviewSurface")
+        cube_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.5, 0.5, 0.5))
+        cube_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.8)
+        cube_mtl.CreateSurfaceOutput().ConnectToSource(cube_shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI(cube.GetPrim()).Bind(cube_mtl)
+
+        rigid_api = UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
+        rigid_api.CreateKinematicEnabledAttr(True)
+        collision_api = UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+        xform_ops = xform.AddTranslateOp()
+        xform_ops.Set(Gf.Vec3d(float(self.rover_pos[0]), float(self.rover_pos[1]), float(self.rover_pos[2])))
+
+        self._add_apriltag_texture()
+
+        light_path = rover_path + "/SpotLight"
+        spot_light = UsdLux.SphereLight.Define(stage, light_path)
+        spot_light.CreateIntensityAttr(2000.0)
+        spot_light.CreateRadiusAttr(0.05)
+        spot_light.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+
+        light_xform = UsdGeom.Xformable(spot_light)
+        light_translate = light_xform.AddTranslateOp()
+        light_translate.Set(Gf.Vec3d(0, 0, 0.5))
+
+        print(f"[Rover] Created at {self.rover_pos}")
+
+    def _add_apriltag_texture(self):
+        stage = omni.usd.get_context().get_stage()
+
+        mesh_path = "/World/Rover/TagMesh"
+        mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+
+        half = 0.5
+        mesh.GetPointsAttr().Set([
+            Gf.Vec3f(-half, -half, 0),
+            Gf.Vec3f(half, -half, 0),
+            Gf.Vec3f(half, half, 0),
+            Gf.Vec3f(-half, half, 0)
+        ])
+        mesh.GetFaceVertexCountsAttr().Set([4])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3])
+        mesh.GetNormalsAttr().Set([Gf.Vec3f(0, 0, 1)] * 4)
+        mesh.SetNormalsInterpolation("vertex")
+
+        texcoords = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+        )
+        texcoords.Set([Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)])
+
+        xform = UsdGeom.Xformable(mesh)
+        translate_op = xform.AddTranslateOp()
+        translate_op.Set(Gf.Vec3d(0, 0, 0.51))
+
+        tag_image_path = self._generate_apriltag_image()
+
+        mtl_path = Sdf.Path(mesh_path + "_Material")
+        mtl = UsdShade.Material.Define(stage, mtl_path)
+
+        shader = UsdShade.Shader.Define(stage, mtl_path.AppendPath("Shader"))
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.1)
+
+        st_reader = UsdShade.Shader.Define(stage, mtl_path.AppendPath("stReader"))
+        st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+        st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+
+        diffuse_tex = UsdShade.Shader.Define(stage, mtl_path.AppendPath("DiffuseTexture"))
+        diffuse_tex.CreateIdAttr("UsdUVTexture")
+        diffuse_tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(tag_image_path)
+        diffuse_tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            st_reader.ConnectableAPI(), "result"
+        )
+
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            diffuse_tex.ConnectableAPI(), "rgb"
+        )
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            diffuse_tex.ConnectableAPI(), "rgb"
+        )
+
+        mtl.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI(mesh.GetPrim()).Bind(mtl)
+
+        print(f"[Rover] AprilTag texture added")
+
+    def _generate_apriltag_image(self):
+        if not ARUCO_AVAILABLE:
+            return "/tmp/dummy_tag.png"
+
+        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+        tag_size = 512
+        border_bits = 1
+
+        tag_image = np.zeros((tag_size, tag_size), dtype=np.uint8)
+        tag_image = aruco.generateImageMarker(aruco_dict, 0, tag_size, tag_image, border_bits)
+
+        full_size = 600
+        full_image = np.ones((full_size, full_size), dtype=np.uint8) * 255
+        offset = (full_size - tag_size) // 2
+        full_image[offset:offset+tag_size, offset:offset+tag_size] = tag_image
+
+        output_path = "/tmp/apriltag_36h11_id0.png"
+        cv2.imwrite(output_path, full_image)
+
+        return output_path
+
+    def _setup_camera(self):
+        stage = omni.usd.get_context().get_stage()
+
+        camera_path = "/World/Drone/body/Camera"
+        camera_prim = UsdGeom.Camera.Define(stage, camera_path)
+
+        camera_prim.GetFocalLengthAttr().Set(8.0)
+        camera_prim.GetHorizontalApertureAttr().Set(60.0)
+        camera_prim.GetVerticalApertureAttr().Set(33.75)
+        camera_prim.GetFocusDistanceAttr().Set(1000.0)
+        camera_prim.GetFStopAttr().Set(0.0)
+        camera_prim.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 10000.0))
+
+        xform = UsdGeom.Xformable(camera_prim)
+        xform.ClearXformOpOrder()
+        translate_op = xform.AddTranslateOp()
+        translate_op.Set(Gf.Vec3d(0, 0, -0.11))
+
+        if ARUCO_AVAILABLE:
+            try:
+                import omni.replicator.core as rep
+                self.render_product = rep.create.render_product(camera_path, (1280, 720))
+                self.annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+                self.annotator.attach([self.render_product])
+                print("[Camera] 1280x720 @ 150 deg FOV")
+            except Exception as e:
+                print(f"[WARN] Camera setup failed: {e}")
+                self.annotator = None
+
+    def _init_aruco(self):
+        img_w, img_h = 1280, 720
+        fov_deg = 150.0
+        self.fx = img_w / (2 * np.tan(np.radians(fov_deg / 2)))
+        self.fy = self.fx
+        self.cx = img_w / 2
+        self.cy = img_h / 2
+
+        self.camera_matrix = np.array([
+            [self.fx, 0, self.cx],
+            [0, self.fy, self.cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+
+        self.aruco_dicts = {
+            "DICT_APRILTAG_36h11": aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11),
+        }
+        self.aruco_params = aruco.DetectorParameters()
+
+        print(f"[ArUco] Initialized")
+
+    def _detect_aruco(self):
+        try:
+            image_data = self.annotator.get_data()
+
+            if image_data is None:
+                return
+
+            if not isinstance(image_data, np.ndarray) or image_data.size == 0:
+                return
+
+            if len(image_data.shape) == 3:
+                gray = cv2.cvtColor(image_data[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                color_image = image_data[:, :, :3].astype(np.uint8).copy()
+            else:
+                gray = image_data.astype(np.uint8)
+                color_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+            corners, ids = None, None
+            detected_dict_name = None
+            for dict_name, aruco_dict in self.aruco_dicts.items():
+                detector = aruco.ArucoDetector(aruco_dict, self.aruco_params)
+                corners, ids, _ = detector.detectMarkers(gray)
+                if ids is not None and len(ids) > 0:
+                    detected_dict_name = dict_name
+                    break
+
+            vis_img = color_image.copy()
+
+            if ids is not None and len(ids) > 0:
+                aruco.drawDetectedMarkers(vis_img, corners, ids)
+
+                rvecs, tvecs = self._estimate_pose(corners, 0.768)
+
+                if tvecs is not None and len(tvecs) > 0:
+                    tvec = tvecs[0][0]
+
+                    drone_state = self.drone.state
+                    drone_pos = np.array(drone_state.position)
+                    drone_quat = np.array(drone_state.attitude)
+
+                    r = Rotation.from_quat(drone_quat)
+
+                    marker_in_body = np.array([
+                        -tvec[1],
+                        tvec[0],
+                        -tvec[2]
+                    ])
+                    marker_in_body[2] -= 0.11
+                    marker_in_world = drone_pos + r.apply(marker_in_body)
+
+                    self._on_detection(marker_in_world[:2])
+
+                    self.detection_count += 1
+                    self.last_detection_time = self.step_count * 0.01
+
+                    cv2.drawFrameAxes(vis_img, self.camera_matrix, self.dist_coeffs,
+                                     rvecs[0].reshape(3,1), tvecs[0].reshape(3,1), 0.3)
+
+            cv2.line(vis_img, (int(self.cx)-20, int(self.cy)), (int(self.cx)+20, int(self.cy)), (255,0,0), 2)
+            cv2.line(vis_img, (int(self.cx), int(self.cy)-20), (int(self.cx), int(self.cy)+20), (255,0,0), 2)
+
+            num_markers = 0 if ids is None else len(ids)
+            if num_markers > 0:
+                status = f"Markers: {num_markers}"
+                color = (0, 255, 0)
+            else:
+                status = "No markers"
+                color = (0, 0, 255)
+
+            cv2.putText(vis_img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+        except Exception as e:
+            if self.step_count % 100 == 0:
+                print(f"[WARN] Detection error: {e}")
+
+    def _estimate_pose(self, corners, marker_size):
+        marker_points = np.array([
+            [-marker_size/2, marker_size/2, 0],
+            [marker_size/2, marker_size/2, 0],
+            [marker_size/2, -marker_size/2, 0],
+            [-marker_size/2, -marker_size/2, 0]
+        ], dtype=np.float32)
+
+        rvecs, tvecs = [], []
+        for corner in corners:
+            retval, rvec, tvec = cv2.solvePnP(
+                marker_points, corner, self.camera_matrix, self.dist_coeffs,
+                None, None, False, cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            if retval:
+                rvecs.append(rvec.reshape(1, 3))
+                tvecs.append(tvec.reshape(1, 3))
+
+        if len(rvecs) == 0:
+            return None, None
+        return np.array(rvecs), np.array(tvecs)
+
+    def _on_detection(self, marker_pos_xy):
+        full_pos = np.array([marker_pos_xy[0], marker_pos_xy[1], self.rover_pos[2]])
+        self.controller.update_estimator(full_pos)
+
+    def _update_rover(self, dt):
+        stage = omni.usd.get_context().get_stage()
+        rover_prim = stage.GetPrimAtPath("/World/Rover")
+
+        if not rover_prim.IsValid():
+            return
+
+        self.rover_pos += self.rover_vel * dt
+        self.controller.set_rover_pos(self.rover_pos)
+
+        xformable = UsdGeom.Xformable(rover_prim)
+        translate_op = None
+        for op in xformable.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+
+        if translate_op:
+            translate_op.Set(Gf.Vec3d(float(self.rover_pos[0]), float(self.rover_pos[1]), float(self.rover_pos[2])))
 
     async def control_drone(self):
-        """MAVSDK를 사용한 드론 제어 (별도 스레드의 이벤트 루프에서 실행)"""
-        
         drone = System()
         await drone.connect(system_address="udp://:14540")
 
-        print("드론 연결 대기 중...")
+        print("[MAVSDK] 드론 연결 대기 중...")
         async for state in drone.core.connection_state():
             if state.is_connected:
-                print("-- 드론 연결 완료!")
+                print("[MAVSDK] -- 드론 연결 완료!")
                 break
 
-        print("GPS 위치 추정 대기 중...")
+        print("[MAVSDK] GPS 위치 추정 대기 중...")
         async for health in drone.telemetry.health():
             if health.is_global_position_ok and health.is_home_position_ok:
-                print("-- GPS 위치 추정 완료")
+                print("[MAVSDK] -- GPS 위치 추정 완료")
                 break
 
-        print("-- Arming")
+        print("[MAVSDK] -- Arming")
         await drone.action.arm()
 
-        print("-- 초기 setpoint 설정")
+        print("[MAVSDK] -- 초기 setpoint 설정")
         await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.0))
 
-        print("-- Offboard 모드 시작")
+        print("[MAVSDK] -- Offboard 모드 시작")
         try:
             await drone.offboard.start()
         except OffboardError as error:
-            print(f"Offboard 모드 시작 실패: {error._result.result}")
-            print("-- Disarming")
+            print(f"[MAVSDK] Offboard 모드 시작 실패: {error._result.result}")
             await drone.action.disarm()
             return
 
-        print("-- 70% 추력으로 상승")
-        await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.7))
-        await asyncio.sleep(2)
+        # 1단계: 상승
+        print(f"[MAVSDK] -- 1단계: 상승 시작 (목표: {self.takeoff_target_height}m)")
+        drone_state = self.drone.state
+        current_pos = np.array(drone_state.position)
+        takeoff_target = current_pos.copy()
+        takeoff_target[2] = self.takeoff_target_height
 
-        print("-- Roll 30도, 60% 추력")
-        await drone.offboard.set_attitude(Attitude(30.0, 0.0, 0.0, 0.6))
-        await asyncio.sleep(2)
+        self.controller.set_takeoff_target(takeoff_target)
 
-        print("-- Roll -30도, 60% 추력")
-        await drone.offboard.set_attitude(Attitude(-30.0, 0.0, 0.0, 0.6))
-        await asyncio.sleep(2)
+        while self.controller.takeoff_mode and not self.stop_sim and simulation_app.is_running():
+            drone_state = self.drone.state
+            self.controller.update_state(drone_state)
+            self.controller.update(0.02)
 
-        print("-- Hover, 60% 추력")
-        await drone.offboard.set_attitude(Attitude(0.0, 0.0, 0.0, 0.6))
-        await asyncio.sleep(2)
+            attitude_cmd = self.controller.get_attitude_rate()
 
-        print("-- Offboard 모드 중지")
+            if isinstance(attitude_cmd, Attitude):
+                await drone.offboard.set_attitude(attitude_cmd)
+            else:
+                await drone.offboard.set_attitude_rate(attitude_cmd)
+
+            await asyncio.sleep(0.02)
+
+        print("[MAVSDK] -- 1단계 완료: 상승 완료")
+        await asyncio.sleep(1.0)
+
+        # 2단계: RL 착륙 제어
+        print("[MAVSDK] -- 2단계: RL 착륙 제어 시작 (변환 레이어 적용)")
+        self.flight_phase = "LANDING"
+
+        while not self.stop_sim and simulation_app.is_running():
+            drone_state = self.drone.state
+            self.controller.update_state(drone_state)
+            self.controller.update(0.02)
+
+            attitude_cmd = self.controller.get_attitude_rate()
+
+            if isinstance(attitude_cmd, Attitude):
+                await drone.offboard.set_attitude(attitude_cmd)
+            else:
+                await drone.offboard.set_attitude_rate(attitude_cmd)
+
+            await asyncio.sleep(0.02)
+
+        print("[MAVSDK] -- Offboard 모드 중지")
         try:
             await drone.offboard.stop()
         except OffboardError as error:
-            print(f"Offboard 모드 중지 실패: {error._result.result}")
+            print(f"[MAVSDK] Offboard 모드 중지 실패: {error._result.result}")
 
-        print("-- 착륙")
+        print("[MAVSDK] -- 착륙")
         await drone.action.land()
-        
-        # 착륙 완료 대기
-        await asyncio.sleep(5)
-        
-        # 시뮬레이션 종료 신호
-        self.stop_sim = True
+        await asyncio.sleep(3)
 
     def run_control_thread(self):
-        """별도 스레드에서 asyncio 이벤트 루프를 실행하여 드론 제어"""
-        
-        # 시뮬레이션 초기화 대기
-        import time
-        print("시뮬레이션 초기화 중... (5초 대기)")
-        time.sleep(5)
-        
-        # 새로운 이벤트 루프 생성 및 실행
+        print("[MAVSDK] 시뮬레이션 초기화 중...")
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
         try:
             loop.run_until_complete(self.control_drone())
         finally:
             loop.close()
 
     def run(self):
-        """시뮬레이션 메인 루프"""
-        
-        # 드론 제어를 별도 스레드에서 시작
         control_thread = threading.Thread(target=self.run_control_thread, daemon=True)
         control_thread.start()
-        
-        # 시뮬레이션 시작
+
         self.timeline.play()
-        
-        # 메인 시뮬레이션 루프
-        while simulation_app.is_running() and not self.stop_sim:
+
+        print("[Camera] Waiting for initialization (3 seconds)...")
+        for _ in range(300):
             self.world.step(render=True)
-        
-        # 종료
-        carb.log_warn("시뮬레이션 종료 중...")
+            self.step_count += 1
+        print("[Camera] Ready!")
+
+        while simulation_app.is_running() and not self.stop_sim:
+            self._detect_aruco()
+            self._update_rover(self.world.get_physics_dt())
+            self.world.step(render=True)
+            self.step_count += 1
+
+            if self.step_count % 100 == 0:
+                drone_state = self.drone.state
+                drone_pos = np.array([drone_state.position[0], drone_state.position[1], drone_state.position[2]])
+                rover_xy_error = np.linalg.norm(drone_pos[:2] - self.rover_pos[:2])
+
+                if self.controller.estimated_rover_pos is not None:
+                    detection_status = "Tracking"
+                else:
+                    detection_status = "No tag"
+
+                phase_str = f"[{self.flight_phase}]"
+
+                print(f"[{self.step_count*0.01:.1f}s] {phase_str} {detection_status} | "
+                    f"XY err: {rover_xy_error:.2f}m | "
+                    f"Height: {drone_pos[2]:.2f}m")
+
+        print(f"\n{'='*70}")
+        print(f"[Summary] 시뮬레이션 종료")
+        print(f"{'='*70}")
+
+        try:
+            for backend in self.drone._backends:
+                if hasattr(backend, 'stop'):
+                    backend.stop()
+        except Exception as e:
+            print(f"[Cleanup] Backend stop error: {e}")
+
         self.timeline.stop()
         simulation_app.close()
 
 
 def main():
-    pg_app = PegasusApp()
-    pg_app.run()
+    import sys
+    import signal
+
+    app = None
+
+    def cleanup_handler(signum, frame):
+        print("\n[Signal] 종료 신호 수신...")
+        if app is not None:
+            app.stop_sim = True
+
+    signal.signal(signal.SIGINT, cleanup_handler)
+    signal.signal(signal.SIGTERM, cleanup_handler)
+
+    if len(sys.argv) > 1:
+        model_path = sys.argv[1]
+    else:
+        model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-20_15-52-16/model.zip"
+
+    print(f"\n{'='*70}")
+    print(f"RL 드론 착륙 시뮬레이션 (변환 레이어 적용)")
+    print(f"{'='*70}")
+    print(f"[Main] Model: {model_path}")
+    print(f"\n변환 레이어:")
+    print(f"  - Isaac Lab 토크 명령 -> PX4 Attitude 명령")
+    print(f"  - Action 인덱스 수정: [0]=thrust, [1]=roll, [2]=pitch, [3]=yaw")
+    print(f"  - 추력/관성모멘트 스케일 보정")
+    print(f"{'='*70}\n")
+
+    if not RL_AVAILABLE:
+        print("[ERROR] stable-baselines3 not installed!")
+        return
+
+    try:
+        app = PegasusRLLandingApp(model_path)
+        app.run()
+    except Exception as e:
+        print(f"[ERROR] 예외 발생: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        import subprocess
+        try:
+            subprocess.run(["pkill", "-f", "px4"], capture_output=True, timeout=5)
+        except:
+            pass
 
 
 if __name__ == "__main__":
