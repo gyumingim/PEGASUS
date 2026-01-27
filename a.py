@@ -52,6 +52,7 @@ except ImportError:
     print("[WARN] OpenCV not available")
 
 
+
 class IsaacLabToPX4Converter:
     """
     Isaac Lab 토크 명령 → PX4 Attitude 명령 변환 레이어
@@ -84,6 +85,7 @@ class IsaacLabToPX4Converter:
         # ========== Iris (Pegasus) 물리 파라미터 ==========
         self.IRIS_MASS = 1.5  # Iris 질량 (kg)
         self.IRIS_GRAVITY = 9.81
+        self.IRIS_HOVER_THRUST = 0.65  # 캘리브레이션으로 측정된 호버 추력
 
         # Iris 관성모멘트 (kg·m²) - 대략적 추정값
         self.IRIS_Ixx = 0.029
@@ -134,6 +136,7 @@ class IsaacLabToPX4Converter:
         print(f"  실행 환경 (Iris):")
         print(f"    Mass: {self.IRIS_MASS} kg")
         print(f"    Ixx/Iyy: {self.IRIS_Ixx} kg*m^2")
+        print(f"    Hover thrust: {self.IRIS_HOVER_THRUST} (calibrated)")
         print(f"  변환 비율:")
         print(f"    Mass ratio: {self.MASS_RATIO:.1f}x")
         print(f"    Inertia ratio (roll/pitch): {self.INERTIA_RATIO_ROLL:.1f}x")
@@ -157,7 +160,7 @@ class IsaacLabToPX4Converter:
         """
 
         # ========== 1. 액션 필터링 (노이즈 제거) ==========
-        alpha = 0.4  # 필터 계수 (0.3~0.5 권장)
+        alpha = 1.0  # 필터 계수 (0.3~0.5 권장)
         filtered_action = alpha * isaac_action + (1 - alpha) * self.prev_action
         self.prev_action = filtered_action.copy()
 
@@ -170,7 +173,7 @@ class IsaacLabToPX4Converter:
         pitch_action = filtered_action[2]    # pitch 토크 (인덱스 2!)
         yaw_action = filtered_action[3]      # yaw 토크
 
-        # ========== 3. 추력 변환 ==========
+        # ========== 3. 추력 변환 (캘리브레이션 적용) ==========
         # Isaac Lab: thrust_ratio = 1.9 * (action + 1) / 2
         # action = 0 → ratio = 0.95 (거의 호버링)
         # action = 0.053 → ratio ≈ 1.0 (정확한 호버링)
@@ -178,11 +181,11 @@ class IsaacLabToPX4Converter:
         # Isaac Lab 추력 비율 계산
         isaac_thrust_ratio = self.TRAIN_THRUST_TO_WEIGHT * (thrust_action + 1.0) / 2.0
 
-        # PX4 추력으로 변환 (호버링 = 0.5 기준)
-        # isaac_ratio 1.0 → px4 0.5
-        # isaac_ratio 1.9 → px4 ~0.95
-        # isaac_ratio 0.0 → px4 0.0
-        px4_thrust = isaac_thrust_ratio / self.TRAIN_THRUST_TO_WEIGHT
+        # PX4 추력으로 변환 (캘리브레이션된 호버 추력 기준)
+        # isaac_ratio = 1.0 (호버링) → px4 = IRIS_HOVER_THRUST
+        # 스케일: (isaac_ratio - 1.0) 당 추력 변화량
+        thrust_scale = 0.5  # 튜닝 가능: isaac_ratio 1단위 변화당 px4 thrust 변화
+        px4_thrust = self.IRIS_HOVER_THRUST + (isaac_thrust_ratio - 1.0) * thrust_scale
         px4_thrust = np.clip(px4_thrust, 0.0, 1.0)
 
         # ========== 4. 토크 → 목표 각도 변환 ==========
@@ -219,7 +222,7 @@ class IsaacLabToPX4Converter:
             print(f"  Isaac action: [{thrust_action:+.3f}, {roll_action:+.3f}, "
                   f"{pitch_action:+.3f}, {yaw_action:+.3f}]")
             print(f"  Isaac thrust ratio: {isaac_thrust_ratio:.3f} (hover=1.0)")
-            print(f"  PX4 thrust: {px4_thrust:.3f} (hover=0.5)")
+            print(f"  PX4 thrust: {px4_thrust:.3f} (hover={self.IRIS_HOVER_THRUST:.2f}, calibrated)")
             print(f"  Target angle: roll={target_roll:+.1f} deg, pitch={target_pitch:+.1f} deg")
             print(f"  Final cmd: roll={final_roll:+.1f} deg, pitch={final_pitch:+.1f} deg, "
                   f"yaw={final_yaw:+.1f} deg, thrust={px4_thrust:.3f}")
@@ -258,7 +261,7 @@ class RLDroneLandingController:
 
     # 목표 위치 오프셋 (튜닝용)
     TARGET_X_OFFSET = 0.9  # X 방향 오프셋 (m)
-    TARGET_Y_OFFSET = 0.5   # Y 방향 오프셋 (m)
+    TARGET_Y_OFFSET = 0   # Y 방향 오프셋 (m)
 
     # ============================================================
     # 바람은 PegasusRLLandingApp에서 실제 물리로 적용됨
@@ -578,7 +581,7 @@ class PegasusRLLandingApp:
 
         # ========== 바람 물리 설정 (Isaac Lab과 동기화) ==========
         self.wind_enabled = True
-        self.wind_max_speed = 5.0  # 최대 바람 속도 (m/s)
+        self.wind_max_speed = 3.0  # 최대 바람 속도 (m/s)
         # 랜덤 바람 생성: XY는 -10~10, Z는 항상 0
         random_wind_xy = (np.random.rand(2) * 2 - 1) * self.wind_max_speed
         self.wind_velocity = np.array([random_wind_xy[0], random_wind_xy[1], 0.0], dtype=np.float32)
@@ -598,6 +601,10 @@ class PegasusRLLandingApp:
 
         if ARUCO_AVAILABLE:
             self._init_aruco()
+
+        # 카메라 뷰 저장 경로
+        self.camera_view_path = "/tmp/drone_camera_view.png"
+        print(f"[Camera] View saved to: {self.camera_view_path}")
 
         self.world.reset()
 
@@ -870,6 +877,23 @@ class PegasusRLLandingApp:
 
             cv2.putText(vis_img, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
+            # 바람 속도 표시
+            wind_speed = np.linalg.norm(self.wind_velocity)
+            wind_text = f"Wind: ({self.wind_velocity[0]:.1f}, {self.wind_velocity[1]:.1f}) m/s | Speed: {wind_speed:.1f} m/s"
+            cv2.putText(vis_img, wind_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            # 마커 인식 여부 상세 표시
+            if ids is not None and len(ids) > 0:
+                marker_info = f"Marker ID: {ids[0][0]} | Dict: {detected_dict_name}"
+                cv2.putText(vis_img, marker_info, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                cv2.putText(vis_img, "Marker: NOT DETECTED", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            # 카메라 뷰를 파일로 저장 (10프레임마다)
+            if self.step_count % 10 == 0:
+                vis_img_bgr = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(self.camera_view_path, vis_img_bgr)
+
         except Exception as e:
             if self.step_count % 100 == 0:
                 print(f"[WARN] Detection error: {e}")
@@ -1104,6 +1128,7 @@ class PegasusRLLandingApp:
         print(f"\n{'='*70}")
         print(f"[Summary] 시뮬레이션 종료")
         print(f"{'='*70}")
+
 
         try:
             for backend in self.drone._backends:
