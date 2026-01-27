@@ -258,8 +258,10 @@ class RLDroneLandingController:
 
     # 목표 위치 오프셋 (튜닝용)
     TARGET_X_OFFSET = 0.9  # X 방향 오프셋 (m)
-    TARGET_Y_OFFSET = -0.4   # Y 방향 오프셋 (m)
+    TARGET_Y_OFFSET = 0.5   # Y 방향 오프셋 (m)
 
+    # ============================================================
+    # 바람은 PegasusRLLandingApp에서 실제 물리로 적용됨
     # ============================================================
 
     def __init__(self, rover_initial_pos, rover_velocity, model_path, device="cuda", detection_callback=None):
@@ -409,6 +411,7 @@ class RLDroneLandingController:
         R = Rotation.from_quat(quat_xyzw)
 
         # 1. 드론 속도 (body frame)
+        # 실제 물리 바람이 적용되므로 lin_vel에 이미 바람 효과가 반영됨
         lin_vel_b = R.inv().apply(lin_vel)
         lin_vel_b = lin_vel_b * self.VEL_SCALE
 
@@ -427,6 +430,7 @@ class RLDroneLandingController:
             desired_pos_b = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         # 5. 상대 속도 (body frame)
+        # 실제 물리 바람이 적용되므로 lin_vel에 이미 바람 효과가 반영됨
         rel_vel_world = lin_vel - self.rover_vel
         rel_vel_b = R.inv().apply(rel_vel_world)
         rel_vel_b = rel_vel_b * self.VEL_SCALE
@@ -571,6 +575,22 @@ class PegasusRLLandingApp:
         )
 
         self.stop_sim = False
+
+        # ========== 바람 물리 설정 (Isaac Lab과 동기화) ==========
+        self.wind_enabled = True
+        self.wind_max_speed = 5.0  # 최대 바람 속도 (m/s)
+        # 랜덤 바람 생성: XY는 -10~10, Z는 항상 0
+        random_wind_xy = (np.random.rand(2) * 2 - 1) * self.wind_max_speed
+        self.wind_velocity = np.array([random_wind_xy[0], random_wind_xy[1], 0.0], dtype=np.float32)
+
+        # 공기역학 파라미터 (Isaac Lab과 동기화)
+        self.air_density = 1.225  # kg/m³ (해수면 기준)
+        self.drag_coefficient = 1.0  # 항력 계수
+        self.drone_cross_section = 0.1  # 단면적 m²
+
+        print(f"[Wind] Enabled: {self.wind_enabled}")
+        print(f"[Wind] Random velocity: ({self.wind_velocity[0]:.2f}, {self.wind_velocity[1]:.2f}, 0.0) m/s")
+        print(f"[Wind] Speed: {np.linalg.norm(self.wind_velocity):.2f} m/s")
 
         self._add_lighting()
         self._create_rover()
@@ -900,6 +920,57 @@ class PegasusRLLandingApp:
         if translate_op:
             translate_op.Set(Gf.Vec3d(float(self.rover_pos[0]), float(self.rover_pos[1]), float(self.rover_pos[2])))
 
+    def _apply_wind_force(self):
+        """실제 물리 바람 힘을 드론에 적용"""
+        if not self.wind_enabled:
+            return
+
+        # 드론 상태 가져오기
+        drone_state = self.drone.state
+        drone_vel = np.array(drone_state.linear_velocity, dtype=np.float32)
+        drone_quat = np.array(drone_state.attitude, dtype=np.float32)  # [x, y, z, w]
+
+        # 상대 속도 (airspeed) = 드론 속도 - 바람 속도
+        # 바람이 +X로 불면, 드론이 정지해 있어도 -X 방향 상대 속도를 느낌
+        relative_velocity = drone_vel - self.wind_velocity
+
+        # 상대 속도 크기
+        rel_speed = np.linalg.norm(relative_velocity)
+
+        if rel_speed < 0.01:  # 거의 정지 상태면 스킵
+            return
+
+        # 항력 (Drag) 계산: F_drag = 0.5 * rho * Cd * A * v^2 * (-v_hat)
+        # 항력은 상대 속도 반대 방향으로 작용
+        drag_magnitude = 0.5 * self.air_density * self.drag_coefficient * self.drone_cross_section * rel_speed**2
+
+        # 항력 방향 (상대 속도 반대)
+        drag_direction = -relative_velocity / rel_speed
+
+        # World frame에서의 항력
+        drag_force_world = drag_magnitude * drag_direction
+
+        # Body frame으로 변환 (apply_force는 body frame 기준)
+        R = Rotation.from_quat(drone_quat)
+        drag_force_body = R.inv().apply(drag_force_world)
+
+        # FLU 좌표계로 변환 (Pegasus 규약)
+        # World: X-forward, Y-left, Z-up
+        # Body FLU: X-forward, Y-left, Z-up (동일하지만 회전된 상태)
+        force_flu = [
+            float(drag_force_body[0]),  # Forward
+            float(drag_force_body[1]),  # Left
+            float(drag_force_body[2])   # Up
+        ]
+
+        # 드론에 힘 적용
+        self.drone.apply_force(force_flu, body_part="/body")
+
+        # 디버깅 (가끔 출력)
+        if self.step_count % 200 == 0:
+            print(f"[Wind] vel={self.wind_velocity}, drag_world=[{drag_force_world[0]:.2f}, "
+                  f"{drag_force_world[1]:.2f}, {drag_force_world[2]:.2f}] N")
+
     async def control_drone(self):
         drone = System()
         await drone.connect(system_address="udp://:14540")
@@ -1010,6 +1081,7 @@ class PegasusRLLandingApp:
         while simulation_app.is_running() and not self.stop_sim:
             self._detect_aruco()
             self._update_rover(self.world.get_physics_dt())
+            self._apply_wind_force()  # 실제 바람 물리 적용
             self.world.step(render=True)
             self.step_count += 1
 
@@ -1061,7 +1133,7 @@ def main():
     if len(sys.argv) > 1:
         model_path = sys.argv[1]
     else:
-        model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-20_15-52-16/model.zip"
+        model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-27_09-06-42/model.zip"
 
     print(f"\n{'='*70}")
     print(f"RL 드론 착륙 시뮬레이션 (변환 레이어 적용)")
