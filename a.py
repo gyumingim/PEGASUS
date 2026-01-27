@@ -253,15 +253,19 @@ class RLDroneLandingController:
     # ============================================================
 
     DEBUG_MODE = True
-    USE_ARUCO = False  # Ground truth 사용
+
+    # 감지 모드 설정
+    # True: AprilTag 인식으로 로버 위치 추정
+    # False: Ground Truth (시뮬레이터에서 로버 위치 직접 사용)
+    USE_APRILTAG = True
 
     # Observation 스케일
     VEL_SCALE = 1.0
     ANG_VEL_SCALE = 1.0
 
     # 목표 위치 오프셋 (튜닝용)
-    TARGET_X_OFFSET = 0.9  # X 방향 오프셋 (m)
-    TARGET_Y_OFFSET = 0   # Y 방향 오프셋 (m)
+    TARGET_X_OFFSET = 0  # X 방향 오프셋 (m)
+    TARGET_Y_OFFSET = 0  # Y 방향 오프셋 (m)
 
     # ============================================================
     # 바람은 PegasusRLLandingApp에서 실제 물리로 적용됨
@@ -307,9 +311,9 @@ class RLDroneLandingController:
         self.takeoff_target_pos = None
 
         # 목표 위치 (world frame)
-        if self.USE_ARUCO:
-            self.desired_pos_w = None
-        else:
+        if self.USE_APRILTAG:
+            self.desired_pos_w = None  # AprilTag 감지 후 설정됨
+        else:  # ground_truth
             self.desired_pos_w = np.array(rover_initial_pos, dtype=np.float32)
             self.desired_pos_w[2] = self.landing_height
 
@@ -317,7 +321,11 @@ class RLDroneLandingController:
         print("RL Controller 초기화 완료")
         print("="*60)
         print(f"  DEBUG_MODE: {self.DEBUG_MODE}")
-        print(f"  USE_ARUCO:  {self.USE_ARUCO}")
+        print(f"  USE_APRILTAG: {self.USE_APRILTAG}")
+        if self.USE_APRILTAG:
+            print(f"    → AprilTag 인식으로 로버 위치 추정")
+        else:
+            print(f"    → Ground Truth (시뮬레이터 직접 위치)")
         print(f"  변환 레이어: IsaacLabToPX4Converter 사용")
         print("="*60 + "\n")
 
@@ -326,19 +334,24 @@ class RLDroneLandingController:
         self.time += dt
         self.converter.dt = dt  # 변환 레이어에도 dt 전달
 
-        if self.USE_ARUCO:
+        if self.USE_APRILTAG:
+            # AprilTag 인식 모드: 감지된 위치만 사용 (Ground Truth 사용 안함)
             if self.estimated_rover_pos is not None:
                 if self.desired_pos_w is None:
                     self.desired_pos_w = self.estimated_rover_pos.copy()
+                    self.desired_pos_w[2] = self.landing_height
                 else:
                     self.desired_pos_w[:2] = self.estimated_rover_pos[:2]
-                    self.desired_pos_w[2] = self.rover_pos[2]
+                    self.desired_pos_w[2] = self.landing_height
+            # 태그 미감지 시 desired_pos_w는 None 유지 → 호버링
         else:
+            # Ground Truth 모드: 시뮬레이터 로버 위치 직접 사용
             if self.desired_pos_w is None:
                 self.desired_pos_w = np.array(self.rover_pos, dtype=np.float32)
+                self.desired_pos_w[2] = self.landing_height
             else:
                 self.desired_pos_w[:2] = self.rover_pos[:2]
-                self.desired_pos_w[2] = self.rover_pos[2]
+                self.desired_pos_w[2] = self.landing_height
 
         # XY 오프셋 적용 (목표 위치 보정)
         if self.desired_pos_w is not None:
@@ -374,7 +387,10 @@ class RLDroneLandingController:
             else:
                 return Attitude(0.0, 0.0, 0.0, 0.6)
 
-        if self.USE_ARUCO and self.desired_pos_w is None:
+        # AprilTag 모드에서 아직 마커 감지 못했으면 호버링
+        if self.USE_APRILTAG and self.desired_pos_w is None:
+            if self._action_debug_count % 50 == 0:
+                print("[RL] AprilTag 미감지 - 호버링 유지")
             return Attitude(0.0, 0.0, 0.0, 0.6)
 
         # Observation 구성
@@ -434,7 +450,12 @@ class RLDroneLandingController:
 
         # 5. 상대 속도 (body frame)
         # 실제 물리 바람이 적용되므로 lin_vel에 이미 바람 효과가 반영됨
-        rel_vel_world = lin_vel - self.rover_vel
+        if self.USE_APRILTAG:
+            # AprilTag 모드: 로버 속도를 0으로 가정 (GT 사용 안함)
+            rel_vel_world = lin_vel
+        else:
+            # Ground Truth 모드: 실제 로버 속도 사용
+            rel_vel_world = lin_vel - self.rover_vel
         rel_vel_b = R.inv().apply(rel_vel_world)
         rel_vel_b = rel_vel_b * self.VEL_SCALE
 
@@ -446,18 +467,22 @@ class RLDroneLandingController:
         )
 
         # 디버깅 출력
+        mode_str = "AprilTag" if self.USE_APRILTAG else "GroundTruth"
         if (self.DEBUG_MODE or self._obs_debug_count < 5) and self._obs_debug_count % 50 == 1:
             print(f"\n{'='*70}")
-            print(f"Observation Debug (step {self._obs_debug_count})")
+            print(f"Observation Debug (step {self._obs_debug_count}) | Mode: {mode_str}")
             print(f"{'='*70}")
             print(f"  Drone pos (world):    [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}]")
-            print(f"  Rover pos (world):    [{self.rover_pos[0]:6.2f}, {self.rover_pos[1]:6.2f}, {self.rover_pos[2]:6.2f}]")
+            if not self.USE_APRILTAG:
+                print(f"  Rover pos (GT):       [{self.rover_pos[0]:6.2f}, {self.rover_pos[1]:6.2f}, {self.rover_pos[2]:6.2f}]")
+            if self.USE_APRILTAG and self.estimated_rover_pos is not None:
+                print(f"  Estimated pos (tag):  [{self.estimated_rover_pos[0]:6.2f}, {self.estimated_rover_pos[1]:6.2f}, {self.estimated_rover_pos[2]:6.2f}]")
             if self.desired_pos_w is not None:
                 goal_rel_world = self.desired_pos_w - pos
                 print(f"  Desired pos (world):  [{self.desired_pos_w[0]:6.2f}, {self.desired_pos_w[1]:6.2f}, {self.desired_pos_w[2]:6.2f}]")
                 print(f"  Goal rel (world):     [{goal_rel_world[0]:6.2f}, {goal_rel_world[1]:6.2f}, {goal_rel_world[2]:6.2f}] (norm: {np.linalg.norm(goal_rel_world):.2f}m)")
             else:
-                print(f"  Desired pos (world):  None (waiting for ArUco)")
+                print(f"  Desired pos (world):  None (waiting for AprilTag)")
 
             print(f"  Goal rel (body):      [{desired_pos_b[0]:6.2f}, {desired_pos_b[1]:6.2f}, {desired_pos_b[2]:6.2f}]")
             print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
@@ -581,7 +606,7 @@ class PegasusRLLandingApp:
 
         # ========== 바람 물리 설정 (Isaac Lab과 동기화) ==========
         self.wind_enabled = True
-        self.wind_max_speed = 3.0  # 최대 바람 속도 (m/s)
+        self.wind_max_speed = 0.0  # 최대 바람 속도 (m/s)
         # 랜덤 바람 생성: XY는 -10~10, Z는 항상 0
         random_wind_xy = (np.random.rand(2) * 2 - 1) * self.wind_max_speed
         self.wind_velocity = np.array([random_wind_xy[0], random_wind_xy[1], 0.0], dtype=np.float32)
@@ -600,7 +625,7 @@ class PegasusRLLandingApp:
         self._setup_camera()
 
         if ARUCO_AVAILABLE:
-            self._init_aruco()
+            self._init_apriltag()
 
         # 카메라 뷰 저장 경로
         self.camera_view_path = "/tmp/drone_camera_view.png"
@@ -612,6 +637,12 @@ class PegasusRLLandingApp:
         self.detection_count = 0
         self.last_saved_frame = -1
         self.last_detection_time = 0.0
+
+        # 마지막 감지 데이터 저장 (태그 안 보일 때도 표시용)
+        self.last_marker_in_world = None
+        self.last_marker_in_body = None
+        self.last_tvec = None
+        self.last_tag_center_px = None  # 마지막 태그 중심 픽셀 좌표
 
     def _add_lighting(self):
         stage = omni.usd.get_context().get_stage()
@@ -738,12 +769,12 @@ class PegasusRLLandingApp:
         if not ARUCO_AVAILABLE:
             return "/tmp/dummy_tag.png"
 
-        aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+        apriltag_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
         tag_size = 512
         border_bits = 1
 
         tag_image = np.zeros((tag_size, tag_size), dtype=np.uint8)
-        tag_image = aruco.generateImageMarker(aruco_dict, 0, tag_size, tag_image, border_bits)
+        tag_image = aruco.generateImageMarker(apriltag_dict, 0, tag_size, tag_image, border_bits)
 
         full_size = 600
         full_image = np.ones((full_size, full_size), dtype=np.uint8) * 255
@@ -784,7 +815,8 @@ class PegasusRLLandingApp:
                 print(f"[WARN] Camera setup failed: {e}")
                 self.annotator = None
 
-    def _init_aruco(self):
+    def _init_apriltag(self):
+        """AprilTag 36h11 감지기 초기화"""
         img_w, img_h = 1280, 720
         fov_deg = 150.0
         self.fx = img_w / (2 * np.tan(np.radians(fov_deg / 2)))
@@ -799,14 +831,14 @@ class PegasusRLLandingApp:
         ], dtype=np.float32)
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
 
-        self.aruco_dicts = {
-            "DICT_APRILTAG_36h11": aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11),
-        }
-        self.aruco_params = aruco.DetectorParameters()
+        # AprilTag 36h11 사전만 사용
+        self.apriltag_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+        self.detector_params = aruco.DetectorParameters()
+        self.apriltag_detector = aruco.ArucoDetector(self.apriltag_dict, self.detector_params)
 
-        print(f"[ArUco] Initialized")
+        print(f"[AprilTag] Initialized (36h11)")
 
-    def _detect_aruco(self):
+    def _detect_apriltag(self):
         try:
             image_data = self.annotator.get_data()
 
@@ -823,36 +855,47 @@ class PegasusRLLandingApp:
                 gray = image_data.astype(np.uint8)
                 color_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-            corners, ids = None, None
-            detected_dict_name = None
-            for dict_name, aruco_dict in self.aruco_dicts.items():
-                detector = aruco.ArucoDetector(aruco_dict, self.aruco_params)
-                corners, ids, _ = detector.detectMarkers(gray)
-                if ids is not None and len(ids) > 0:
-                    detected_dict_name = dict_name
-                    break
+            # AprilTag 36h11 감지
+            corners, ids, _ = self.apriltag_detector.detectMarkers(gray)
 
             vis_img = color_image.copy()
+            img_h, img_w = vis_img.shape[:2]
+
+            # 드론 상태 가져오기
+            drone_state = self.drone.state
+            drone_pos = np.array(drone_state.position)
+            drone_quat = np.array(drone_state.attitude)
+            r = Rotation.from_quat(drone_quat)
+
+            # 디버그 변수 초기화
+            marker_in_world = None
+            marker_in_body = None
+            tvec_debug = None
 
             if ids is not None and len(ids) > 0:
                 aruco.drawDetectedMarkers(vis_img, corners, ids)
 
-                rvecs, tvecs = self._estimate_pose(corners, 0.768)
+                # 마커 크기: 메쉬 1m × (태그픽셀 512 / 전체픽셀 600) = 0.853m
+                MARKER_SIZE = 1.0 * (512.0 / 600.0)  # = 0.8533m
+                rvecs, tvecs = self._estimate_pose(corners, MARKER_SIZE)
 
                 if tvecs is not None and len(tvecs) > 0:
                     tvec = tvecs[0][0]
+                    tvec_debug = tvec.copy()
 
-                    drone_state = self.drone.state
-                    drone_pos = np.array(drone_state.position)
-                    drone_quat = np.array(drone_state.attitude)
-
-                    r = Rotation.from_quat(drone_quat)
-
+                    # 카메라 프레임 → 바디 프레임 변환
+                    # OpenCV 카메라: X-right, Y-down, Z-forward (depth)
+                    # 바디 (FLU): X-forward, Y-left, Z-up
+                    # 카메라가 드론 아래(-Z body)를 향함:
+                    #   이미지 아래(+cam_y) = 드론 앞(+body_x)
+                    #   이미지 오른쪽(+cam_x) = 드론 오른쪽(-body_y)
+                    #   깊이(+cam_z) = 드론 아래(-body_z)
                     marker_in_body = np.array([
-                        -tvec[1],
-                        tvec[0],
-                        -tvec[2]
+                        tvec[0],    # body_x = +cam_y (이미지 아래 → 드론 앞)
+                        -tvec[1],   # body_y = -cam_x (이미지 오른쪽 → 드론 오른쪽 = -Y)
+                        -tvec[2]    # body_z = -cam_z (깊이 → 드론 아래)
                     ])
+                    # 카메라 오프셋 보정 (카메라가 바디 중심에서 z=-0.11 위치)
                     marker_in_body[2] -= 0.11
                     marker_in_world = drone_pos + r.apply(marker_in_body)
 
@@ -861,12 +904,98 @@ class PegasusRLLandingApp:
                     self.detection_count += 1
                     self.last_detection_time = self.step_count * 0.01
 
+                    # 마지막 감지 데이터 저장 (태그 안 보일 때도 표시용)
+                    self.last_marker_in_world = marker_in_world.copy()
+                    self.last_marker_in_body = marker_in_body.copy()
+                    self.last_tvec = tvec_debug.copy()
+                    tag_center = corners[0][0].mean(axis=0).astype(int)
+                    self.last_tag_center_px = tuple(tag_center)
+
                     cv2.drawFrameAxes(vis_img, self.camera_matrix, self.dist_coeffs,
                                      rvecs[0].reshape(3,1), tvecs[0].reshape(3,1), 0.3)
 
-            cv2.line(vis_img, (int(self.cx)-20, int(self.cy)), (int(self.cx)+20, int(self.cy)), (255,0,0), 2)
-            cv2.line(vis_img, (int(self.cx), int(self.cy)-20), (int(self.cx), int(self.cy)+20), (255,0,0), 2)
+                    # 태그 중심점 표시 (녹색 원 - 현재 감지)
+                    cv2.circle(vis_img, self.last_tag_center_px, 15, (0, 255, 0), 3)
+                    cv2.putText(vis_img, "TAG", (tag_center[0]+20, tag_center[1]),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
+            # ===== 화면 중심 십자선 (파란색) =====
+            cv2.line(vis_img, (int(self.cx)-30, int(self.cy)), (int(self.cx)+30, int(self.cy)), (255, 0, 0), 2)
+            cv2.line(vis_img, (int(self.cx), int(self.cy)-30), (int(self.cx), int(self.cy)+30), (255, 0, 0), 2)
+            cv2.putText(vis_img, "CENTER", (int(self.cx)+5, int(self.cy)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+
+            # ===== Ground Truth 로버 위치를 화면에 투영 (빨간색) =====
+            rover_rel_world = self.rover_pos - drone_pos
+            rover_rel_body = r.inv().apply(rover_rel_world)
+            # Body to Camera (카메라→바디 변환의 역)
+            # body_x=cam_y, body_y=-cam_x, body_z=-cam_z 의 역
+            # → cam_x=-body_y, cam_y=body_x, cam_z=-body_z
+            rover_in_cam = np.array([-rover_rel_body[1], rover_rel_body[0], -rover_rel_body[2]])
+            if rover_in_cam[2] > 0.1:  # 카메라 앞에 있을 때만
+                gt_px = int(self.fx * rover_in_cam[0] / rover_in_cam[2] + self.cx)
+                gt_py = int(self.fy * rover_in_cam[1] / rover_in_cam[2] + self.cy)
+                if 0 <= gt_px < img_w and 0 <= gt_py < img_h:
+                    cv2.drawMarker(vis_img, (gt_px, gt_py), (0, 0, 255), cv2.MARKER_CROSS, 30, 3)
+                    cv2.putText(vis_img, "GT", (gt_px+5, gt_py-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # ===== 디버그 텍스트 (우측 상단) =====
+            y_offset = 30
+            line_height = 25
+
+            # 드론 위치
+            cv2.putText(vis_img, f"Drone: ({drone_pos[0]:.2f}, {drone_pos[1]:.2f}, {drone_pos[2]:.2f})",
+                       (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y_offset += line_height
+
+            # Ground Truth 로버 위치
+            cv2.putText(vis_img, f"GT Rover: ({self.rover_pos[0]:.2f}, {self.rover_pos[1]:.2f}, {self.rover_pos[2]:.2f})",
+                       (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            y_offset += line_height
+
+            # 현재 또는 마지막 감지 데이터 사용
+            display_marker_world = marker_in_world if marker_in_world is not None else self.last_marker_in_world
+            display_marker_body = marker_in_body if marker_in_body is not None else self.last_marker_in_body
+            display_tvec = tvec_debug if tvec_debug is not None else self.last_tvec
+            is_current = marker_in_world is not None
+
+            if display_marker_world is not None:
+                # 추정된 태그 위치 (world)
+                status_suffix = "" if is_current else " (last)"
+                color = (0, 255, 0) if is_current else (0, 180, 180)  # 현재: 녹색, 마지막: 노란색
+                cv2.putText(vis_img, f"Est Tag: ({display_marker_world[0]:.2f}, {display_marker_world[1]:.2f}, {display_marker_world[2]:.2f}){status_suffix}",
+                           (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                y_offset += line_height
+
+                # 오차 계산 (XY만)
+                error_xy = np.linalg.norm(display_marker_world[:2] - self.rover_pos[:2])
+                error_vec = display_marker_world[:2] - self.rover_pos[:2]
+                cv2.putText(vis_img, f"Error: {error_xy:.2f}m (dx:{error_vec[0]:.2f}, dy:{error_vec[1]:.2f})",
+                           (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                y_offset += line_height
+
+                # tvec (camera frame)
+                if display_tvec is not None:
+                    cv2.putText(vis_img, f"tvec(cam): ({display_tvec[0]:.2f}, {display_tvec[1]:.2f}, {display_tvec[2]:.2f})",
+                               (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    y_offset += line_height
+
+                # marker_in_body
+                if display_marker_body is not None:
+                    cv2.putText(vis_img, f"body: ({display_marker_body[0]:.2f}, {display_marker_body[1]:.2f}, {display_marker_body[2]:.2f})",
+                               (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    y_offset += line_height
+
+            # 마지막 태그 위치 표시 (태그 안 보일 때 - 노란색 원)
+            if not is_current and self.last_tag_center_px is not None:
+                cv2.circle(vis_img, self.last_tag_center_px, 15, (0, 180, 180), 2)
+                cv2.putText(vis_img, "LAST", (self.last_tag_center_px[0]+20, self.last_tag_center_px[1]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 180, 180), 2)
+
+            # 데이터 없음
+            if display_marker_world is None:
+                cv2.putText(vis_img, "Est Tag: N/A (no detection yet)", (img_w - 400, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
+
+            # ===== 좌측 상단 상태 표시 =====
             num_markers = 0 if ids is None else len(ids)
             if num_markers > 0:
                 status = f"Markers: {num_markers}"
@@ -884,13 +1013,13 @@ class PegasusRLLandingApp:
 
             # 마커 인식 여부 상세 표시
             if ids is not None and len(ids) > 0:
-                marker_info = f"Marker ID: {ids[0][0]} | Dict: {detected_dict_name}"
+                marker_info = f"Marker ID: {ids[0][0]} | Dict: AprilTag 36h11"
                 cv2.putText(vis_img, marker_info, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
                 cv2.putText(vis_img, "Marker: NOT DETECTED", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # 카메라 뷰를 파일로 저장 (10프레임마다)
-            if self.step_count % 10 == 0:
+            # 카메라 뷰를 파일로 저장 (3프레임마다 - 높은 프레임레이트)
+            if self.step_count % 3 == 0:
                 vis_img_bgr = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(self.camera_view_path, vis_img_bgr)
 
@@ -921,7 +1050,10 @@ class PegasusRLLandingApp:
         return np.array(rvecs), np.array(tvecs)
 
     def _on_detection(self, marker_pos_xy):
-        full_pos = np.array([marker_pos_xy[0], marker_pos_xy[1], self.rover_pos[2]])
+        # Z좌표는 고정값 사용 (Ground Truth 사용 안함)
+        # 로버 높이는 약 -0.4m (큐브 중심) + 0.5 (큐브 반높이) = 0.1m 정도
+        ROVER_Z_FIXED = 0.1  # 로버 상단 높이 (고정값)
+        full_pos = np.array([marker_pos_xy[0], marker_pos_xy[1], ROVER_Z_FIXED])
         self.controller.update_estimator(full_pos)
 
     def _update_rover(self, dt):
@@ -932,7 +1064,10 @@ class PegasusRLLandingApp:
             return
 
         self.rover_pos += self.rover_vel * dt
-        self.controller.set_rover_pos(self.rover_pos)
+
+        # Ground Truth 모드에서만 컨트롤러에 로버 위치 전달
+        if not self.controller.USE_APRILTAG:
+            self.controller.set_rover_pos(self.rover_pos)
 
         xformable = UsdGeom.Xformable(rover_prim)
         translate_op = None
@@ -1103,7 +1238,7 @@ class PegasusRLLandingApp:
         print("[Camera] Ready!")
 
         while simulation_app.is_running() and not self.stop_sim:
-            self._detect_aruco()
+            self._detect_apriltag()
             self._update_rover(self.world.get_physics_dt())
             self._apply_wind_force()  # 실제 바람 물리 적용
             self.world.step(render=True)
@@ -1159,17 +1294,22 @@ def main():
         model_path = sys.argv[1]
     else:
         model_path = "/home/rtx5080/s/ISAAC_LAB_DRONE/logs/sb3/Template-DroneLanding-v0/2026-01-27_09-06-42/model.zip"
-
+    
     print(f"\n{'='*70}")
     print(f"RL 드론 착륙 시뮬레이션 (변환 레이어 적용)")
     print(f"{'='*70}")
     print(f"[Main] Model: {model_path}")
+    print(f"[Main] USE_APRILTAG: {RLDroneLandingController.USE_APRILTAG}")
+    if RLDroneLandingController.USE_APRILTAG:
+        print(f"  → AprilTag 인식으로 로버 위치 추정 (Ground Truth 사용 안함)")
+    else:
+        print(f"  → Ground Truth (시뮬레이터 직접 위치)")
     print(f"\n변환 레이어:")
     print(f"  - Isaac Lab 토크 명령 -> PX4 Attitude 명령")
     print(f"  - Action 인덱스 수정: [0]=thrust, [1]=roll, [2]=pitch, [3]=yaw")
     print(f"  - 추력/관성모멘트 스케일 보정")
     print(f"{'='*70}\n")
-
+    
     if not RL_AVAILABLE:
         print("[ERROR] stable-baselines3 not installed!")
         return
