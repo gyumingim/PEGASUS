@@ -19,6 +19,8 @@ import threading
 from typing import Optional
 from collections import deque
 from threading import Lock
+from scipy.spatial.transform import Rotation
+import math
 
 # b.py에서 AprilTagLanding 가져오기
 from b import AprilTagLanding
@@ -78,7 +80,12 @@ class IsaacLabToPX4Converter:
 
     def __init__(self):
         self.TRAIN_THRUST_TO_WEIGHT = 1.9
-        self.DRONE_HOVER_THRUST = 0.75  # ★ hover thrust 증가
+        self.DRONE_HOVER_THRUST = 0.75  # PX4 실제 호버 추력
+        
+        # ★ 새로운 파라미터: Thrust 보정
+        self.THRUST_OFFSET = 0.0  # 추력 바이어스 (실시간 조정 가능)
+        self.MIN_THRUST = 0.70     # 최소 추력 제한 (추락 방지)
+        self.MAX_THRUST = 1.0     # 최대 추력 제한
 
         self.TORQUE_TO_ANGLE_GAIN_ROLL = 7.0
         self.TORQUE_TO_ANGLE_GAIN_PITCH = 7.0
@@ -89,25 +96,41 @@ class IsaacLabToPX4Converter:
 
         self.integrated_yaw = 0.0
         self.prev_action = np.zeros(4)
+        self.prev_thrust = 0.0
         self.dt = 0.02
 
     def convert(self, isaac_action: np.ndarray) -> dict:
         """변환 후 dict로 반환 (로깅용)"""
+        # ===== 1단계: 전체 액션 필터링 =====
         alpha = 0.3
         filtered_action = alpha * isaac_action + (1 - alpha) * self.prev_action
         self.prev_action = filtered_action.copy()
         filtered_action = np.clip(filtered_action, -1.0, 1.0)
 
+        # ===== 2단계: Thrust 추가 필터링 =====
         thrust_action = filtered_action[0]
+        alpha_thrust = 0.2
+        thrust_action = alpha_thrust * thrust_action + (1 - alpha_thrust) * self.prev_thrust
+        self.prev_thrust = thrust_action
+        
         roll_action = filtered_action[1]
         pitch_action = filtered_action[2]
         yaw_action = filtered_action[3]
 
+        # ===== 3단계: Thrust 변환 (Offset 적용!) =====
         isaac_thrust_ratio = self.TRAIN_THRUST_TO_WEIGHT * (thrust_action + 1.0) / 2.0
         thrust_scale = 0.5
+        
+        # 기본 변환
         px4_thrust = self.DRONE_HOVER_THRUST + (isaac_thrust_ratio - 1.0) * thrust_scale
-        px4_thrust = np.clip(px4_thrust, 0.0, 1.0)
+        
+        # ★ Offset 적용 (중력 보정)
+        px4_thrust = px4_thrust + self.THRUST_OFFSET
+        
+        # ★ 최소/최대 제한 (추락 방지)
+        px4_thrust = np.clip(px4_thrust, self.MIN_THRUST, self.MAX_THRUST)
 
+        # ===== 나머지 동일 =====
         target_roll = roll_action * self.TORQUE_TO_ANGLE_GAIN_ROLL
         target_pitch = pitch_action * self.TORQUE_TO_ANGLE_GAIN_PITCH
 
@@ -129,7 +152,7 @@ class IsaacLabToPX4Converter:
     def reset(self):
         self.integrated_yaw = 0.0
         self.prev_action = np.zeros(4)
-
+        self.prev_thrust = 0.0
 
 class PX4Controller:
     """PX4 연결 및 제어"""
@@ -580,6 +603,8 @@ class RLOutputTester:
         self.last_valid_target_body = None  # 마지막으로 감지된 목표 위치
         self.last_marker_detection_time = None  # 마지막 마커 감지 시간
 
+        self._obs_debug_count = 0
+
     def get_drone_state(self) -> dict:
         """드론 상태 가져오기 (PX4 telemetry 또는 가상)"""
         if self.use_px4 and self.px4.connected:
@@ -590,45 +615,73 @@ class RLOutputTester:
         # PX4 미사용 또는 데이터 없으면 가상 상태
         return self.fake_drone_state
 
+
     def _construct_observation(self, target_pos_body: np.ndarray) -> np.ndarray:
-        """16차원 observation 구성 (Isaac Lab FLU 좌표계로 변환)"""
+        """16차원 observation 구성 (Isaac Lab FLU 좌표계)"""
         state = self.get_drone_state()
 
         lin_vel = state['velocity']           # NED world frame
         ang_vel = state['angular_velocity']   # FRD body frame (PX4)
-        quat = state['attitude_quat']
+        quat = state['attitude_quat']         # [x, y, z, w]
 
-        R = quat_to_rotation_matrix(quat)
-        R_inv = R.T
+        # Scipy Rotation 사용
+        R = Rotation.from_quat(quat)
+        R_inv = R.as_matrix().T  # 전치 = 역행렬
 
-        # ===== PX4 (NED/FRD) → Isaac Lab (ENU/FLU) 변환 =====
+        # ===== 1. 선속도 (body frame) =====
         # NED velocity → body frame (FRD)
         lin_vel_frd = R_inv @ lin_vel
-
-        # FRD → FLU 변환: [Forward, Right, Down] → [Forward, Left, Up]
-        # x_flu = x_frd, y_flu = -y_frd, z_flu = -z_frd
+        # FRD → FLU 변환
         lin_vel_b = np.array([lin_vel_frd[0], -lin_vel_frd[1], -lin_vel_frd[2]]) * self.VEL_SCALE
 
-        # 각속도: FRD → FLU 변환
+        # ===== 2. 각속도 (body frame) =====
+        # PX4 angular_velocity는 이미 body frame (FRD)
+        # FRD → FLU 변환
         ang_vel_b = np.array([ang_vel[0], -ang_vel[1], -ang_vel[2]])
 
-        # 중력 방향: PX4는 NED이므로 gravity_ned = [0, 0, +1]
-        gravity_ned = np.array([0, 0, 1.0])  # NED: +Z = 아래
+        # ===== 3. 중력 방향 (body frame) =====
+        # ✅ 수정: PX4는 NED 좌표계 사용
+        gravity_ned = np.array([0, 0, 1.0])  # NED: +Z = 아래 (중력 방향)
         gravity_frd = R_inv @ gravity_ned
         # FRD → FLU 변환
         gravity_b = np.array([gravity_frd[0], -gravity_frd[1], -gravity_frd[2]])
 
+        # ===== 4. 목표 위치 (body frame) =====
         desired_pos_b = target_pos_body
+
+        # ===== 5. 상대 속도 (body frame) =====
         rel_vel_b = lin_vel_b
 
+        # ===== 6. Yaw 각도 =====
         quat_wxyz = np.array([quat[3], quat[0], quat[1], quat[2]])
         yaw = np.arctan2(
             2.0 * (quat_wxyz[0]*quat_wxyz[3] + quat_wxyz[1]*quat_wxyz[2]),
             1.0 - 2.0 * (quat_wxyz[2]**2 + quat_wxyz[3]**2)
         )
 
+        # 디버깅 출력
+        if self._obs_debug_count % 50 == 1:
+            pos = state['position']
+            print(f"\n{'='*70}")
+            print(f"Observation Debug (step {self._obs_debug_count})")
+            print(f"{'='*70}")
+            print(f"  Drone pos (world):    [{pos[0]:6.2f}, {pos[1]:6.2f}, {pos[2]:6.2f}]")
+            print(f"  Target (body):        [{desired_pos_b[0]:6.2f}, {desired_pos_b[1]:6.2f}, {desired_pos_b[2]:6.2f}]")
+            print(f"  Lin vel (body):       [{lin_vel_b[0]:6.2f}, {lin_vel_b[1]:6.2f}, {lin_vel_b[2]:6.2f}]")
+            print(f"  Ang vel (body):       [{ang_vel_b[0]:6.2f}, {ang_vel_b[1]:6.2f}, {ang_vel_b[2]:6.2f}]")
+            print(f"  Gravity (body):       [{gravity_b[0]:6.2f}, {gravity_b[1]:6.2f}, {gravity_b[2]:6.2f}]")
+            print(f"  Yaw: {np.degrees(yaw):6.1f} deg")
+        
+        self._obs_debug_count += 1
+
+        # 16차원 observation
         obs = np.concatenate([
-            lin_vel_b, ang_vel_b, gravity_b, desired_pos_b, rel_vel_b, [yaw]
+            lin_vel_b,        # 3
+            ang_vel_b,        # 3
+            gravity_b,        # 3
+            desired_pos_b,    # 3
+            rel_vel_b,        # 3
+            [yaw]             # 1
         ])
 
         return obs.astype(np.float32)
