@@ -18,6 +18,7 @@ import asyncio
 import threading
 from typing import Optional
 from collections import deque
+from threading import Lock
 
 # b.py에서 AprilTagLanding 가져오기
 from b import AprilTagLanding
@@ -144,7 +145,8 @@ class PX4Controller:
         self.armed = False
         self.offboard_active = False
         
-        # 최신 telemetry 데이터
+        # 최신 telemetry 데이터 (Thread-safe)
+        self._telemetry_lock = Lock()
         self.latest_position = None
         self.latest_velocity = None
         self.latest_attitude_euler = None  # [roll, pitch, yaw] in degrees
@@ -170,7 +172,15 @@ class PX4Controller:
         self.thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self.thread.start()
         print(f"[PX4] 연결 시작: {self.connection_string}")
-        time.sleep(2)  # 연결 대기
+        
+        # ✅ 연결 대기 (최대 5초)
+        for _ in range(50):
+            if self.connected:
+                print("[PX4] ✓ 연결 완료")
+                break
+            time.sleep(0.1)
+        else:
+            print("[PX4] ⚠ 연결 대기 타임아웃 (5초)")
 
     def stop(self):
         """종료"""
@@ -185,96 +195,124 @@ class PX4Controller:
         asyncio.set_event_loop(self.loop)
         try:
             self.loop.run_until_complete(self._async_main())
+        except Exception as e:
+            print(f"[PX4] ✗ 비동기 루프 예외: {e}")
         finally:
             self.loop.close()
 
     async def _async_main(self):
         """메인 비동기 루프"""
-        # 연결
-        await self.drone.connect(system_address=self.connection_string)
-        
-        # 연결 대기
-        print("[PX4] 드론 연결 대기 중...")
-        async for state in self.drone.core.connection_state():
-            if state.is_connected:
-                self.connected = True
-                print("[PX4] ✓ 드론 연결 완료")
-                break
-        
-        # Telemetry 구독 시작
-        asyncio.create_task(self._telemetry_position())
-        asyncio.create_task(self._telemetry_velocity())
-        asyncio.create_task(self._telemetry_attitude())
-        asyncio.create_task(self._telemetry_angular_velocity())
-        asyncio.create_task(self._telemetry_flight_mode())
-        
-        # 메인 루프
-        while self.running:
-            await asyncio.sleep(0.02)  # 50Hz
+        try:
+            # 연결
+            await self.drone.connect(system_address=self.connection_string)
+            
+            # 연결 대기
+            print("[PX4] 드론 연결 대기 중...")
+            async for state in self.drone.core.connection_state():
+                if state.is_connected:
+                    self.connected = True
+                    print("[PX4] ✓ 드론 연결 완료")
+                    break
+            
+            # Telemetry 구독 시작
+            asyncio.create_task(self._telemetry_position())
+            asyncio.create_task(self._telemetry_velocity())
+            asyncio.create_task(self._telemetry_attitude())
+            asyncio.create_task(self._telemetry_angular_velocity())
+            asyncio.create_task(self._telemetry_flight_mode())
+            
+            # 메인 루프
+            while self.running:
+                await asyncio.sleep(0.02)  # 50Hz
+                
+        except Exception as e:
+            print(f"[PX4] ✗ 비동기 메인 루프 예외: {e}")
+            self.running = False
 
     async def _telemetry_position(self):
         """위치 telemetry"""
-        async for position in self.drone.telemetry.position():
-            self.latest_position = np.array([
-                position.latitude_deg,
-                position.longitude_deg,
-                position.absolute_altitude_m
-            ])
-            self.latest_relative_altitude = position.relative_altitude_m
+        try:
+            async for position in self.drone.telemetry.position():
+                with self._telemetry_lock:
+                    self.latest_position = np.array([
+                        position.latitude_deg,
+                        position.longitude_deg,
+                        position.absolute_altitude_m
+                    ])
+                    self.latest_relative_altitude = position.relative_altitude_m
+        except Exception as e:
+            print(f"[PX4] Position telemetry 예외: {e}")
 
     async def _telemetry_velocity(self):
         """속도 telemetry (NED)"""
-        async for velocity in self.drone.telemetry.velocity_ned():
-            self.latest_velocity = np.array([
-                velocity.north_m_s,
-                velocity.east_m_s,
-                velocity.down_m_s
-            ])
+        try:
+            async for velocity in self.drone.telemetry.velocity_ned():
+                with self._telemetry_lock:
+                    self.latest_velocity = np.array([
+                        velocity.north_m_s,
+                        velocity.east_m_s,
+                        velocity.down_m_s
+                    ])
+        except Exception as e:
+            print(f"[PX4] Velocity telemetry 예외: {e}")
 
     async def _telemetry_attitude(self):
         """자세 telemetry (Euler angles)"""
-        async for attitude in self.drone.telemetry.attitude_euler():
-            self.latest_attitude_euler = np.array([
-                attitude.roll_deg,
-                attitude.pitch_deg,
-                attitude.yaw_deg
-            ])
+        try:
+            async for attitude in self.drone.telemetry.attitude_euler():
+                with self._telemetry_lock:
+                    self.latest_attitude_euler = np.array([
+                        attitude.roll_deg,
+                        attitude.pitch_deg,
+                        attitude.yaw_deg
+                    ])
+        except Exception as e:
+            print(f"[PX4] Attitude telemetry 예외: {e}")
 
     async def _telemetry_angular_velocity(self):
         """각속도 telemetry"""
-        async for angular_vel in self.drone.telemetry.attitude_angular_velocity_body():
-            self.latest_angular_velocity = np.array([
-                angular_vel.roll_rad_s,
-                angular_vel.pitch_rad_s,
-                angular_vel.yaw_rad_s
-            ])
+        try:
+            async for angular_vel in self.drone.telemetry.attitude_angular_velocity_body():
+                with self._telemetry_lock:
+                    self.latest_angular_velocity = np.array([
+                        angular_vel.roll_rad_s,
+                        angular_vel.pitch_rad_s,
+                        angular_vel.yaw_rad_s
+                    ])
+        except Exception as e:
+            print(f"[PX4] Angular velocity telemetry 예외: {e}")
 
     async def _telemetry_flight_mode(self):
         """비행 모드 telemetry"""
-        async for flight_mode in self.drone.telemetry.flight_mode():
-            self.latest_flight_mode = str(flight_mode)
+        try:
+            async for flight_mode in self.drone.telemetry.flight_mode():
+                with self._telemetry_lock:
+                    self.latest_flight_mode = str(flight_mode)
+        except Exception as e:
+            print(f"[PX4] Flight mode telemetry 예외: {e}")
 
     def get_state(self) -> Optional[dict]:
-        """최신 드론 상태 반환"""
+        """최신 드론 상태 반환 (Thread-safe)"""
         if not self.connected:
             return None
         
-        # Euler angles to quaternion
-        attitude_quat = np.array([0, 0, 0, 1])
-        if self.latest_attitude_euler is not None:
-            attitude_quat = euler_to_quat(
-                self.latest_attitude_euler[0],
-                self.latest_attitude_euler[1],
-                self.latest_attitude_euler[2],
-                degrees=True
-            )
-        
-        return {
-            'position': self.latest_position,
-            'velocity': self.latest_velocity if self.latest_velocity is not None else np.zeros(3),
-            'attitude_quat': attitude_quat,
-            'angular_velocity': self.latest_angular_velocity if self.latest_angular_velocity is not None else np.zeros(3)
-        }
+        with self._telemetry_lock:
+            # Euler angles to quaternion
+            attitude_quat = np.array([0, 0, 0, 1])
+            if self.latest_attitude_euler is not None:
+                attitude_quat = euler_to_quat(
+                    self.latest_attitude_euler[0],
+                    self.latest_attitude_euler[1],
+                    self.latest_attitude_euler[2],
+                    degrees=True
+                )
+            
+            return {
+                'position': self.latest_position,
+                'velocity': self.latest_velocity if self.latest_velocity is not None else np.zeros(3),
+                'attitude_quat': attitude_quat,
+                'angular_velocity': self.latest_angular_velocity if self.latest_angular_velocity is not None else np.zeros(3)
+            }
 
     def get_attitude_error(self) -> Optional[dict]:
         """
@@ -283,11 +321,16 @@ class PX4Controller:
         Returns:
             dict with error info or None
         """
-        if self.last_command is None or self.latest_attitude_euler is None:
+        if self.last_command is None:
             return None
         
+        with self._telemetry_lock:
+            if self.latest_attitude_euler is None:
+                return None
+            
+            actual = self.latest_attitude_euler.copy()
+        
         cmd = self.last_command
-        actual = self.latest_attitude_euler
         
         # 각도 차이 계산
         roll_error = actual[0] - cmd['roll_deg']
@@ -348,20 +391,23 @@ class PX4Controller:
             self.armed = True
             print("[PX4] ✓ Armed")
 
-            # action.takeoff() 사용 (3m)
-            print("[PX4] Takeoff (3m)...")
-            await self.drone.action.set_takeoff_altitude(3.0)
+            # action.takeoff() 사용 (6m)
+            print("[PX4] Takeoff (6m)...")
+            await self.drone.action.set_takeoff_altitude(6.0)
             await self.drone.action.takeoff()
             print("[PX4] ✓ Takeoff 명령 전송됨")
 
             # ★ 이륙 완료 대기 (고도 체크)
-            print("[PX4] 이륙 대기 중 (목표: 3m)...")
+            print("[PX4] 이륙 대기 중 (목표: 6m)...")
             takeoff_start = asyncio.get_event_loop().time()
             while True:
                 await asyncio.sleep(0.5)
                 elapsed = asyncio.get_event_loop().time() - takeoff_start
-                alt = self.latest_relative_altitude
-                print(f"[PX4] 상승 중... {alt:.2f}m / 3.0m ({elapsed:.1f}s)")
+                
+                with self._telemetry_lock:
+                    alt = self.latest_relative_altitude
+                
+                print(f"[PX4] 상승 중... {alt:.2f}m / 6.0m ({elapsed:.1f}s)")
 
                 # 목표 고도 도달
                 if alt >= 2.8:
@@ -461,6 +507,10 @@ class PX4Controller:
             self.loop
         )
 
+        # ✅ velocity 모드에서는 last_command를 무효화
+        # (attitude error 계산 불가)
+        self.last_command = None
+
         return True
 
 
@@ -491,7 +541,8 @@ class RLOutputTester:
         # ===== 비행 파라미터 (여기서 한번에 조정) =====
         self.HOVER_THRUST = 0.71      # 호버링 추력
         self.TAKEOFF_THRUST = 0.85    # 이륙 추력
-        self.TARGET_ALTITUDE = 3.0    # 목표 상승 고도 (m)
+        self.TARGET_ALTITUDE = 6.0    # 목표 상승 고도 (m)
+        self.MARKER_LOST_TIMEOUT = 2.0  # ✅ 마커 미감지 타임아웃 (초)
 
         # Converter에도 hover thrust 동기화
         self.converter.DRONE_HOVER_THRUST = self.HOVER_THRUST
@@ -524,9 +575,10 @@ class RLOutputTester:
         # 비행 단계: "IDLE" -> "TAKEOFF" -> "LANDING"
         self.flight_phase = "IDLE"
 
-        # ★ 마커 감지 상태 (한번이라도 감지되면 True)
+        # ✅ 마커 감지 상태 개선
         self.marker_ever_detected = False
         self.last_valid_target_body = None  # 마지막으로 감지된 목표 위치
+        self.last_marker_detection_time = None  # 마지막 마커 감지 시간
 
     def get_drone_state(self) -> dict:
         """드론 상태 가져오기 (PX4 telemetry 또는 가상)"""
@@ -581,19 +633,6 @@ class RLOutputTester:
 
         return obs.astype(np.float32)
 
-    def _get_current_altitude(self) -> float:
-        """현재 고도 반환 (NED이므로 -down = altitude)"""
-        if self.px4 and self.px4.latest_velocity is not None:
-            # velocity down이 음수이면 상승 중
-            pass
-
-        # Position에서 고도 추정 (상대 고도)
-        state = self.get_drone_state()
-        if state and state.get('position') is not None:
-            # fake_drone_state의 z가 고도 (NED에서는 아래가 양수지만 여기서는 높이로 사용)
-            return state['position'][2] if len(state['position']) > 2 else 0.0
-        return 0.0
-
     def _create_takeoff_command(self) -> dict:
         """이륙 명령 생성 (수평 자세 + 상승 추력)"""
         return {
@@ -626,8 +665,9 @@ class RLOutputTester:
         if self.flight_phase == "TAKEOFF":
             # PX4 텔레메트리에서 상대 고도 사용
             current_altitude = 0.0
-            if self.px4 and self.px4.latest_relative_altitude is not None:
-                current_altitude = self.px4.latest_relative_altitude
+            if self.px4:
+                with self.px4._telemetry_lock:
+                    current_altitude = self.px4.latest_relative_altitude
 
             result['current_altitude'] = current_altitude
 
@@ -654,13 +694,16 @@ class RLOutputTester:
         # ===== LANDING 단계: RL 출력으로 이동 =====
         if not tag_result['detected']:
             result['tag'] = None
+            current_time = time.time()
 
             # ★ 마커 한번도 감지 안됨 → 속도 제어로 제자리 호버링
             if not self.marker_ever_detected:
                 # 현재 yaw 유지
                 current_yaw = 0.0
-                if self.px4 and self.px4.latest_attitude_euler is not None:
-                    current_yaw = self.px4.latest_attitude_euler[2]
+                if self.px4:
+                    with self.px4._telemetry_lock:
+                        if self.px4.latest_attitude_euler is not None:
+                            current_yaw = self.px4.latest_attitude_euler[2]
 
                 # 속도 0으로 제자리 유지 (VelocityNedYaw)
                 result['px4_cmd'] = {
@@ -676,19 +719,49 @@ class RLOutputTester:
                 if self.px4_control_active and self.px4:
                     self.px4.send_velocity_ned(0.0, 0.0, 0.0, current_yaw)
                     result['px4_sent'] = True
-                if self.px4:
-                    result['attitude_error'] = self.px4.get_attitude_error()
+                
+                # ✅ velocity 모드에서는 attitude_error가 None
+                result['attitude_error'] = None
                 return result
 
-            # ★ 마커 이전에 감지된 적 있음 → 마지막 위치로 RL 계속 사용
-            if self.last_valid_target_body is not None:
-                result['detected'] = True  # RL 모드 유지 표시
+            # ✅ 마커 이전에 감지된 적 있음 → 타임아웃 체크
+            if self.last_valid_target_body is not None and self.last_marker_detection_time is not None:
+                time_since_last_detection = current_time - self.last_marker_detection_time
+                
+                # 타임아웃 초과 → velocity hold로 전환
+                if time_since_last_detection > self.MARKER_LOST_TIMEOUT:
+                    current_yaw = 0.0
+                    if self.px4:
+                        with self.px4._telemetry_lock:
+                            if self.px4.latest_attitude_euler is not None:
+                                current_yaw = self.px4.latest_attitude_euler[2]
+                    
+                    result['px4_cmd'] = {
+                        'type': 'velocity',
+                        'north': 0.0,
+                        'east': 0.0,
+                        'down': 0.0,
+                        'yaw_deg': current_yaw
+                    }
+                    
+                    if self.frame_count % 25 == 0:
+                        print(f"  [TIMEOUT] 마커 미감지 {time_since_last_detection:.1f}s - 호버링 모드")
+                    
+                    if self.px4_control_active and self.px4:
+                        self.px4.send_velocity_ned(0.0, 0.0, 0.0, current_yaw)
+                        result['px4_sent'] = True
+                    
+                    result['attitude_error'] = None
+                    return result
+                
+                # 타임아웃 이내 → 마지막 위치로 RL 계속 사용
+                result['detected'] = True
                 result['tag'] = {'id': 0, 'x': 0, 'y': 0, 'z': 0, 'distance': 0,
                                 'roll': 0, 'pitch': 0, 'yaw': 0, 'using_last': True}
                 target_body = self.last_valid_target_body
 
                 if self.frame_count % 25 == 0:
-                    print(f"  [RL] 마커 미감지 - 마지막 위치로 RL 계속 사용")
+                    print(f"  [RL] 마커 미감지 ({time_since_last_detection:.1f}s) - 마지막 위치로 RL 계속")
 
                 obs = self._construct_observation(target_body)
                 result['observation'] = obs.tolist()
@@ -711,10 +784,13 @@ class RLOutputTester:
 
                 return result
 
-            # fallback: 속도 제어로 제자리 호버링 (마지막 위치도 없는 경우)
+            # fallback: 속도 제어로 제자리 호버링
             current_yaw = 0.0
-            if self.px4 and self.px4.latest_attitude_euler is not None:
-                current_yaw = self.px4.latest_attitude_euler[2]
+            if self.px4:
+                with self.px4._telemetry_lock:
+                    if self.px4.latest_attitude_euler is not None:
+                        current_yaw = self.px4.latest_attitude_euler[2]
+            
             result['px4_cmd'] = {
                 'type': 'velocity',
                 'north': 0.0,
@@ -725,12 +801,14 @@ class RLOutputTester:
             if self.px4_control_active and self.px4:
                 self.px4.send_velocity_ned(0.0, 0.0, 0.0, current_yaw)
                 result['px4_sent'] = True
-            if self.px4:
-                result['attitude_error'] = self.px4.get_attitude_error()
+            
+            result['attitude_error'] = None
             return result
 
-        # 태그 감지됨 → 마커 감지 플래그 설정
+        # ✅ 태그 감지됨 → 마커 감지 플래그 및 시간 업데이트
         self.marker_ever_detected = True
+        self.last_marker_detection_time = time.time()
+        
         result['detected'] = True
         result['tag'] = {
             'id': tag_result['tag_id'],
@@ -745,23 +823,14 @@ class RLOutputTester:
         result['corners'] = tag_result.get('corners')
 
         # 2. 카메라 좌표 → Body frame 변환
-        # 카메라가 드론 아래를 향한다고 가정:
-        # cam_x (오른쪽) → body -Y (왼쪽)
-        # cam_y (아래) → body +X (앞)
-        # cam_z (깊이/앞) → body -Z (아래)
-        #
-        # ★ RL 모델의 기대:
-        # - desired_pos_b[2] < 0 → 목표가 "아래"에 있음 → 하강
-        # - desired_pos_b[2] > 0 → 목표가 "위"에 있음 → 상승
-        # 카메라 z가 양수(깊이)면 목표가 아래이므로 body_z는 음수여야 함
         target_body = np.array([
             tag_result['y'],      # body_x = cam_y (앞쪽으로)
             -tag_result['x'],     # body_y = -cam_x (왼쪽으로)
-            -tag_result['z']      # ★ 핵심 수정: body_z = -cam_z (아래쪽 = 음수)
+            -tag_result['z']      # body_z = -cam_z (아래쪽 = 음수)
         ])
         result['target_body'] = target_body.tolist()
 
-        # ★ 마지막 유효 타겟 저장 (마커 안보일 때 사용)
+        # ★ 마지막 유효 타겟 저장
         self.last_valid_target_body = target_body.copy()
 
         # 3. Observation 구성
@@ -796,8 +865,8 @@ class RLOutputTester:
         return result
 
     def print_result(self, result: dict):
+        """결과 출력"""
         if result['frame'] % 25 == 0:
-            """결과 출력"""
             print(f"\n{'='*70}")
             phase_str = result.get('flight_phase', 'IDLE')
             print(f"Frame {result['frame']} | Phase: {phase_str} | PX4: {'Connected' if result['px4_connected'] else 'Disconnected'} | "
@@ -1180,28 +1249,37 @@ class RLOutputTester:
         # ===== 시작 시 바로 PX4 제어 활성화 =====
         if self.use_px4 and self.px4:
             print("\n[자동 시작] PX4 제어 활성화 중 (Arm -> Takeoff 3m -> Offboard)...")
+            
+            # ✅ TAKEOFF 단계 설정
+            self.flight_phase = "TAKEOFF"
+            
             self.px4.enable_control()
 
             # Offboard 활성화 대기 (화면 업데이트하면서)
             print("[자동 시작] Takeoff + Offboard 활성화 대기 중...")
             wait_start = time.time()
-            while time.time() - wait_start < 25:  # ★ 25초로 증가 (takeoff 15s + offboard 준비)
+            while time.time() - wait_start < 25:  # 25초 대기
                 # 화면 업데이트
                 tag_result = self.tag_detector.get_relative_pose()
                 if tag_result.get('image') is not None:
                     img = tag_result['image'].copy()
                     elapsed = time.time() - wait_start
-                    alt = self.px4.latest_relative_altitude
+                    
+                    with self.px4._telemetry_lock:
+                        alt = self.px4.latest_relative_altitude
+                    
                     cv2.putText(img, f"TAKEOFF... {elapsed:.1f}s", (10, 30),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-                    cv2.putText(img, f"Altitude: {alt:.2f}m / 3.0m", (10, 60),
+                    cv2.putText(img, f"Altitude: {alt:.2f}m / 6.0m", (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if alt >= 2.5 else (255, 255, 255), 2)
                     cv2.imshow('Camera + AprilTag', img)
                     cv2.waitKey(1)
 
                 # Offboard 활성화 체크
                 if self.px4.control_enabled:
-                    print(f"[자동 시작] ✓ Offboard 활성화 완료! (고도: {self.px4.latest_relative_altitude:.2f}m)")
+                    with self.px4._telemetry_lock:
+                        current_alt = self.px4.latest_relative_altitude
+                    print(f"[자동 시작] ✓ Offboard 활성화 완료! (고도: {current_alt:.2f}m)")
                     break
 
                 time.sleep(0.1)
